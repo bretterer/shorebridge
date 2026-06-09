@@ -665,6 +665,11 @@ def csta_probe(mac):
         "SetLampMode":                  f'<SetLampMode xmlns="{ED}"><device>{dev}</device><lamp>1</lamp><lampMode>3</lampMode></SetLampMode>',
         "SetButtonInformation":         f'<SetButtonInformation xmlns="{ED}"><device>{dev}</device><buttonID>1</buttonID><buttonLabel>TEST</buttonLabel></SetButtonInformation>',
         "SetMessageWaitingIndicator":   f'<SetMessageWaitingIndicator xmlns="{ED}"><device>{dev}</device><messageWaitingOn>true</messageWaitingOn></SetMessageWaitingIndicator>',
+        "AnswerCall":                   f'<AnswerCall xmlns="{ED}"><callToBeAnswered><deviceID>{dev}</deviceID></callToBeAnswered></AnswerCall>',
+        "MakeCall":                     f'<MakeCall xmlns="{ED}"><callingDevice>{dev}</callingDevice><calledDirectoryNumber>1</calledDirectoryNumber></MakeCall>',
+        "GetForwarding":                f'<GetForwarding xmlns="{ED}"><device>{dev}</device></GetForwarding>',
+        "GetDoNotDisturb":              f'<GetDoNotDisturb xmlns="{ED}"><device>{dev}</device></GetDoNotDisturb>',
+        "GenerateDigits":               f'<GenerateDigits xmlns="{ED}"><connectionToSendDigits><deviceID>{dev}</deviceID></connectionToSendDigits><charactersToSend>1</charactersToSend></GenerateDigits>',
     }
     lines = [f"probing device {dev}:"]
     for name, xml in cands.items():
@@ -834,12 +839,12 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             xml = csta_preset(kind, f.get("ext", ""), f.get("text", "")) if kind != "raw" else f.get("body", "")
             reply = send_to_phone_csta(mac, xml)
             self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
-            self.wfile.write(("SENT:\n" + xml + "\n\nREPLY:\n" + (reply or "")).encode()); return
+            self.wfile.write(("SENT:\n" + xml + "\n\nREPLY:\n" + (reply or "") + "\n").encode()); return
         if path == "/debug/probe" and DEBUG:
             mac = norm_mac(f.get("mac", ""))
             out = csta_probe(mac)
             self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
-            self.wfile.write(out.encode()); return
+            self.wfile.write((out + "\n").encode()); return
         if path == "/add":
             mac = norm_mac(f.get("mac", ""))
             pick = f.get("catalog_ext", "").strip()

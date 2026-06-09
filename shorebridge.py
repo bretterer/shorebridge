@@ -635,15 +635,54 @@ def xaddr_ip(conn):
 # Send a CSTA service request DOWN to a phone over its existing TLS connection
 # (NOTIFY Event: uaCSTA + application/csta+xml). Returns the phone's reply so we can
 # see whether it accepts the service (200 OK + CSTA response) or rejects it.
-ED = "http://www.ecma-international.org/standards/ecma-323/csta/ed4"
-def csta_preset(kind, ext, text=""):
+ED = "http://www.ecma-international.org/standards/ecma-323/csta/ed3"  # match the phone (it uses ed3)
+def mac_colon(mac):
+    return ":".join(mac[i:i+2] for i in range(0, 12, 2)).upper()
+def csta_preset(kind, ext, text="", dev=""):
+    d = dev or ext
     if kind == "answercall":
-        return f'<AnswerCall xmlns="{ED}"><callToBeAnswered><deviceID>{ext}</deviceID></callToBeAnswered></AnswerCall>'
+        return f'<AnswerCall xmlns="{ED}"><callToBeAnswered><deviceID>{d}</deviceID></callToBeAnswered></AnswerCall>'
     if kind == "offhook":
-        return f'<SetHookswitchStatus xmlns="{ED}"><device>{ext}</device><hookswitch>1</hookswitch><hookswitchOnHook>false</hookswitchOnHook></SetHookswitchStatus>'
+        return f'<SetHookswitchStatus xmlns="{ED}"><device>{d}</device><hookswitch>1</hookswitch><hookswitchOnHook>false</hookswitchOnHook></SetHookswitchStatus>'
     if kind == "setdisplay":
-        return f'<SetDisplay xmlns="{ED}"><device>{ext}</device><contentsOfDisplay>{text}</contentsOfDisplay></SetDisplay>'
+        return f'<SetDisplay xmlns="{ED}"><device>{d}</device><contentsOfDisplay>{text}</contentsOfDisplay></SetDisplay>'
     return text  # raw
+
+def csta_probe(mac):
+    """Fire a batch of CSTA services and report which the phone implements."""
+    dev = mac_colon(mac)
+    cands = {
+        "GetPhysicalDeviceInformation": f'<GetPhysicalDeviceInformation xmlns="{ED}"><device>{dev}</device></GetPhysicalDeviceInformation>',
+        "GetDisplay":                   f'<GetDisplay xmlns="{ED}"><device>{dev}</device></GetDisplay>',
+        "GetButtonInformation":         f'<GetButtonInformation xmlns="{ED}"><device>{dev}</device></GetButtonInformation>',
+        "GetHookswitchStatus":          f'<GetHookswitchStatus xmlns="{ED}"><device>{dev}</device></GetHookswitchStatus>',
+        "GetLampInformation":           f'<GetLampInformation xmlns="{ED}"><device>{dev}</device></GetLampInformation>',
+        "GetMessageWaitingIndicator":   f'<GetMessageWaitingIndicator xmlns="{ED}"><device>{dev}</device></GetMessageWaitingIndicator>',
+        "GetDeviceId":                  f'<GetDeviceId xmlns="{ED}"><device>{dev}</device></GetDeviceId>',
+        "GetSwitchingFunctionCapabilities": f'<GetSwitchingFunctionCapabilities xmlns="{ED}"></GetSwitchingFunctionCapabilities>',
+        "SnapshotDevice":               f'<SnapshotDevice xmlns="{ED}"><snapshotObject>{dev}</snapshotObject></SnapshotDevice>',
+        "MonitorStart":                 f'<MonitorStart xmlns="{ED}"><monitorObject><deviceObject>{dev}</deviceObject></monitorObject></MonitorStart>',
+        "SetLampMode":                  f'<SetLampMode xmlns="{ED}"><device>{dev}</device><lamp>1</lamp><lampMode>3</lampMode></SetLampMode>',
+        "SetButtonInformation":         f'<SetButtonInformation xmlns="{ED}"><device>{dev}</device><buttonID>1</buttonID><buttonLabel>TEST</buttonLabel></SetButtonInformation>',
+        "SetMessageWaitingIndicator":   f'<SetMessageWaitingIndicator xmlns="{ED}"><device>{dev}</device><messageWaitingOn>true</messageWaitingOn></SetMessageWaitingIndicator>',
+    }
+    lines = [f"probing device {dev}:"]
+    for name, xml in cands.items():
+        r = send_to_phone_csta(mac, xml) or ""
+        m = re.search(r"<operation>([^<]+)</operation>", r)
+        body = r.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in r else r
+        if "serviceNotSupported" in r:
+            verdict = "not supported"
+        elif m:
+            verdict = f"IMPLEMENTED (rejected our args: {m.group(1)})"
+        elif "no reply" in r:
+            verdict = "(no reply)"
+        elif "Response" in body or "<" in body:
+            verdict = "SUPPORTED -> " + " ".join(body.split())[:160]
+        else:
+            verdict = "?"
+        lines.append(f"  {name}: {verdict}")
+    return "\n".join(lines)
 
 def send_to_phone_csta(mac, body):
     conn = CONNS.get(mac); contact = CONTACTS.get(mac)
@@ -796,6 +835,11 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             reply = send_to_phone_csta(mac, xml)
             self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
             self.wfile.write(("SENT:\n" + xml + "\n\nREPLY:\n" + (reply or "")).encode()); return
+        if path == "/debug/probe" and DEBUG:
+            mac = norm_mac(f.get("mac", ""))
+            out = csta_probe(mac)
+            self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
+            self.wfile.write(out.encode()); return
         if path == "/add":
             mac = norm_mac(f.get("mac", ""))
             pick = f.get("catalog_ext", "").strip()

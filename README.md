@@ -74,16 +74,22 @@ Point a new phone's Config Server at the bridge; it shows up in the UI under **"
 
 By default you type each phone's extension/auth/password into the UI. A **connector** lets shorebridge pull that from your PBX's own source of truth, so the UI shows a **dropdown of real extensions** instead (credentials are resolved server-side and never sent to the browser). Calls never depend on a connector being reachable, resolved credentials are persisted to `phones.json`.
 
-Configure in `config.ini`:
-
-```ini
-[connector]
-type = 3cx
-api_base = https://yourpbx.3cx.cloud   ; the 3CX MANAGEMENT instance, not the SBC
-token    = <admin API bearer token>
-```
-
 `type = manual` (default) means no catalog. A `3cx` connector ships in the box.
+
+### Enabling the 3CX connector
+
+1. In the 3CX admin console (as System Owner): **Admin → Integrations → API → "+ Add"**, Department `DEFAULT`, Role `System Owner`. Save and copy the **Client Secret**.
+2. Edit `/etc/shorebridge/config.ini`:
+   ```ini
+   [connector]
+   type = 3cx
+   api_base      = https://yourpbx.3cx.us   ; your 3CX admin-console URL (not the SBC)
+   client_id     = shorebridge
+   client_secret = <the secret>
+   ```
+3. `sudo systemctl restart shorebridge`, the add-phone form now shows a dropdown of your real 3CX extensions.
+
+(Auth is OAuth client-credentials against `/connect/token`. If your 3CX doesn't return the SIP password over the API, extensions still come through with number + name and you type the password once.)
 
 ### Write a connector
 

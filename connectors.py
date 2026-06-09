@@ -16,7 +16,7 @@ Either add the class here and open a PR, or drop a .py file defining + registeri
 your class into  <data_dir>/connectors.d/  (auto-imported at startup) for a private
 connector with no fork required.
 """
-import json, ssl, urllib.request
+import json, ssl, urllib.request, urllib.parse
 
 # ----------------------------- interface -----------------------------
 class Extension:
@@ -57,37 +57,58 @@ class ManualConnector(Connector):
 @register
 class ThreeCXConnector(Connector):
     """
-    Pulls extensions from a 3CX management API.
+    Pulls extensions from a 3CX v20 Configuration API (XAPI).
 
     [connector]
-    type      = 3cx
-    api_base  = https://yourpbx.3cx.cloud   ; the MANAGEMENT instance, not the SBC
-    token     = <admin API bearer token>
-    insecure  = false                       ; set true to skip TLS verification
+    type          = 3cx
+    api_base      = https://yourpbx.3cx.us   ; your 3CX MANAGEMENT console URL (not the SBC)
+    client_id     = shorebridge              ; from Admin > Integrations > API > + Add
+    client_secret = <the secret it shows>
+    insecure      = false                    ; true to skip TLS verification
 
-    NOTE: the exact endpoint and field names differ between 3CX versions (v18 XAPI vs
-    v20 Configuration API). The defaults below target v20's Users collection; override
-    `endpoint` in config if your install differs. Failures are swallowed (returns []),
-    so a misconfigured connector never breaks calling.
+    Auth is OAuth client-credentials: POST /connect/token, then GET /xapi/v1/Users.
+    If your 3CX doesn't expose the SIP password over the API, extensions still come
+    through with number + name (you type the password once in the UI). All failures
+    are swallowed (returns []), so a misconfigured connector never breaks calling.
     """
     type = "3cx"
     label = "3CX"
-    def list_extensions(self):
-        base  = self.config.get("api_base", "").rstrip("/")
-        token = self.config.get("token", "")
-        if not base or not token:
-            return []
-        endpoint = self.config.get(
-            "endpoint",
-            "/xapi/v1/Users?$select=Number,DisplayName,AuthID,AuthPassword&$top=2000")
+
+    def _ctx(self):
         ctx = ssl.create_default_context()
         if self.config.get("insecure", "").lower() in ("1", "true", "yes"):
             ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-        req = urllib.request.Request(base + endpoint,
-                                     headers={"Authorization": f"Bearer {token}",
+        return ctx
+
+    def _token(self, base, ctx):
+        # allow a pre-obtained bearer token, else client-credentials
+        if self.config.get("token"):
+            return self.config["token"]
+        cid = self.config.get("client_id"); secret = self.config.get("client_secret")
+        if not (cid and secret):
+            return None
+        body = urllib.parse.urlencode({"client_id": cid, "client_secret": secret,
+                                       "grant_type": "client_credentials"}).encode()
+        req = urllib.request.Request(base + "/connect/token", data=body,
+                                     headers={"Content-Type": "application/x-www-form-urlencoded",
                                               "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=8, context=ctx) as r:
+            return json.loads(r.read().decode()).get("access_token")
+
+    def list_extensions(self):
+        base = self.config.get("api_base", "").rstrip("/")
+        if not base:
+            return []
+        ctx = self._ctx()
         try:
-            with urllib.request.urlopen(req, timeout=8, context=ctx) as r:
+            token = self._token(base, ctx)
+            if not token:
+                return []
+            endpoint = self.config.get("endpoint", "/xapi/v1/Users?$top=5000")
+            req = urllib.request.Request(base + endpoint,
+                                         headers={"Authorization": f"Bearer {token}",
+                                                  "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
                 data = json.loads(r.read().decode())
         except Exception:
             return []
@@ -97,11 +118,14 @@ class ThreeCXConnector(Connector):
             num = it.get("Number") or it.get("number")
             if not num:
                 continue
-            out.append(Extension(num,
-                                  it.get("DisplayName") or it.get("FirstName", ""),
-                                  it.get("AuthID") or it.get("AuthId", ""),
-                                  it.get("AuthPassword") or it.get("AuthPass", "")))
+            name = (it.get("DisplayName")
+                    or " ".join(x for x in (it.get("FirstName"), it.get("LastName")) if x).strip())
+            authid = it.get("AuthID") or it.get("AuthId") or it.get("AuthenticationId") or ""
+            pw = (it.get("AuthPassword") or it.get("AuthPass")
+                  or it.get("Password") or it.get("SIPPassword") or "")
+            out.append(Extension(num, name, authid, pw))
         return out
+
     def status(self):
         return f"3cx {self.config.get('api_base', '(no api_base set)')}"
 

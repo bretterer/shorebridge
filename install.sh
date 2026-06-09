@@ -116,6 +116,7 @@ cat > "$ETC/config.ini" <<EOF
 bind_ip = $BIND_IP
 data_dir = $PREFIX
 debug = false
+ui_port = 8910
 
 [pbx]
 sbc_ip   = $SBC_IP
@@ -160,9 +161,12 @@ cat <<EOF
     3. Set Config Server to:  $BIND_IP
     4. Reboot / save:  Mute + 73738#
 
-  The phone will pull its config + trust cert from this host, register over TLS,
-  and appear on your PBX as extension $EXT.
+  The first phone to connect auto-claims extension $EXT. Add more phones
+  (by MAC) from the web UI:
+
+    http://$BIND_IP:8910
 
   Logs:    journalctl -u shorebridge -f
   Config:  $ETC/config.ini   (edit then: systemctl restart shorebridge)
+  Phones:  $ETC/phones.json  (or manage in the web UI)
 EOF

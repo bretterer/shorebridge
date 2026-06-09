@@ -56,19 +56,30 @@ sudo ./install.sh
 
 The phone pulls its config + trust cert, registers over TLS, and shows up on your PBX as your extension. Place and receive calls normally. (Answer incoming calls with the **Answer softkey / Speaker button**, see Limitations.)
 
+## Multiple phones
+
+Each physical phone maps to its own PBX extension, identified by the **MAC** it announces when it registers. The **first** phone to connect auto-claims the extension from the installer config, so a single-phone setup is zero-touch. For more phones, use the web admin UI:
+
+```
+http://<bridge-ip>:8910
+```
+
+Point a new phone's Config Server at the bridge; it shows up in the UI under **"New phones seen"**. Click **assign**, enter its PBX extension + auth ID + password, Save, and it goes in service, no file editing, no restart. Mappings are stored in `/etc/shorebridge/phones.json`. (The UI is LAN-only and unauthenticated for now; keep `:8910` off untrusted networks.)
+
 ## Configuration
 
 `/etc/shorebridge/config.ini` (see [`config.example.ini`](config.example.ini)). Edit and `systemctl restart shorebridge`. Logs: `journalctl -u shorebridge -f`.
 
 ## Limitations / roadmap
 
-Calls work fully. The remaining items are the proprietary `uaCSTA` "feels native" layer:
+Calls and multi-phone work. The remaining items are the proprietary `uaCSTA` "feels native" layer (all pushed from the switch over the same channel):
 
+- [ ] **Display name + company name** on the idle screen (the user's name and a system label).
 - [ ] **Off-hook answer** — lifting the handset doesn't answer a ringing call yet (use the Answer/Speaker key); the phone reports off-hook over uaCSTA and expects the switch to connect it.
 - [ ] **Instant N-digit auto-dial** — no digit map pushed, so you press **Dial** (or wait for the inter-digit timeout) instead of it sending on the last digit.
-- [ ] **Directory button**, multi-phone MAC→extension mapping, message-waiting indicator.
+- [ ] **Directory button**, message-waiting indicator, BLF.
 
-These share the same uaCSTA / HTTP plumbing and are good contribution targets.
+These share the same uaCSTA plumbing and are good contribution targets.
 
 ## How the firmware conversion happened (context)
 

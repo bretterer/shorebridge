@@ -3,17 +3,23 @@
 shorebridge - use ShoreTel/Mitel IP400-series phones (IP480/480g/485g) with any
 standard SIP PBX (3CX, FreePBX/Asterisk, FreeSWITCH, ...).
 
-These phones, once on the Mitel/RingCentral "generic SIP" firmware, speak SIP only
-over TLS and pin the server certificate to a CA they download from the config server.
-shorebridge emulates just enough of the ShoreTel switch to make the phone happy
-(config server, CAS, TLS registration, uaCSTA acks) and is a back-to-back user agent
-(B2BUA) to your real PBX. The phone thinks we are its switch; the PBX thinks we are a
-normal SIP extension.
+These phones, on the Mitel/RingCentral "generic SIP" firmware, speak SIP only over
+TLS and pin the server certificate to a CA they download from their config server.
+shorebridge emulates just enough of the ShoreTel switch to make the phone register
+(config server, downloadable trust CA, CAS, TLS, uaCSTA acks) and is a back-to-back
+user agent (B2BUA) to your real PBX. The phone thinks we are its switch; the PBX
+thinks we are normal SIP extensions.
 
-Single process, stdlib only. Configure via /etc/shorebridge/config.ini (see config.example.ini).
+Multi-phone: each physical phone (identified by the MAC it sends in its registration)
+maps to its own PBX extension. Mappings live in phones.json and are managed from a
+small web UI on :8910. The first phone to connect auto-provisions itself from the
+[pbx] defaults in config.ini, so a single-phone install works with zero UI steps.
+
+Single process, Python standard library only.
 """
-import socket, ssl, threading, hashlib, random, time, re, os, sys, configparser
+import socket, ssl, threading, hashlib, random, time, re, os, sys, json, configparser
 import http.server, socketserver, functools
+from urllib.parse import parse_qs, urlparse
 
 # ----------------------------- config -----------------------------
 CFG_PATH = os.environ.get("SHOREBRIDGE_CONFIG", "/etc/shorebridge/config.ini")
@@ -31,20 +37,23 @@ SBC_IP   = CFG.get("pbx", "sbc_ip")
 SBC_PORT = CFG.getint("pbx", "sbc_port", fallback=5060)
 SBC      = (SBC_IP, SBC_PORT)
 DOMAIN   = CFG.get("pbx", "domain")
-EXT      = CFG.get("pbx", "extension")
-AUTHID   = CFG.get("pbx", "auth_id")
-PASSWORD = CFG.get("pbx", "password")
+# [pbx] extension/auth/password are the "default profile" the first phone auto-claims.
+DEF_EXT  = CFG.get("pbx", "extension", fallback="")
+DEF_AUTH = CFG.get("pbx", "auth_id", fallback="")
+DEF_PASS = CFG.get("pbx", "password", fallback="")
 
 _bind    = CFG.get("bridge", "bind_ip", fallback="auto").strip()
 MYIP     = detect_ip(SBC_IP) if _bind in ("", "auto") else _bind
 DATA     = CFG.get("bridge", "data_dir", fallback="/opt/shorebridge")
 TZ       = CFG.get("phone", "timezone", fallback="Eastern Standard Time")
 DEBUG    = CFG.getboolean("bridge", "debug", fallback=False)
+UI_PORT  = CFG.getint("bridge", "ui_port", fallback=8910)
 
 HTTP_ROOT = os.path.join(DATA, "www")
 CERT = os.path.join(DATA, "tls", "switch_fullchain.crt")
 KEY  = os.path.join(DATA, "tls", "switch.key")
 LOGFILE = CFG.get("bridge", "log_file", fallback=os.path.join(DATA, "shorebridge.log"))
+PHONES_JSON = CFG.get("bridge", "phones_file", fallback=os.path.join(os.path.dirname(CFG_PATH), "phones.json"))
 P3CX = 5062  # our local SIP port toward the PBX
 
 lock = threading.Lock()
@@ -56,11 +65,48 @@ def log(m):
         except Exception: pass
 def dbg(m):
     if DEBUG: log(m)
-
 def rid(n=10): return "".join(random.choice("0123456789abcdef") for _ in range(n))
 def md5(s): return hashlib.md5(s.encode()).hexdigest()
 
-# ----------------------------- SIP parse helpers -----------------------------
+# ----------------------------- phone registry -----------------------------
+# PHONES:  mac -> {"extension","auth_id","password","label"}
+# CONNS:   mac -> live TLS connection (the phone's persistent signaling channel)
+# SEEN:    mac -> {"ip","ts"}  phones that connected but have no mapping yet
+# REGOK:   extension -> bool   last registration result toward the PBX
+PHONES = {}; CONNS = {}; CONTACTS = {}; SEEN = {}; REGOK = {}
+reg_threads = {}
+pstate = threading.Lock()
+
+def norm_mac(s):
+    return re.sub(r"[^0-9a-fA-F]", "", s or "").lower()[:12]
+def mac_from_contact(contact):
+    # +sip.instance="<urn:uuid:00000000-0000-1000-8000-001049543b4c>"
+    m = re.search(r'urn:uuid:[0-9a-fA-F-]*?([0-9a-fA-F]{12})"', contact or "")
+    return norm_mac(m.group(1)) if m else None
+
+def load_phones():
+    global PHONES
+    try:
+        with open(PHONES_JSON) as f: data = json.load(f)
+        PHONES = {norm_mac(k): v for k, v in data.items()}
+    except Exception:
+        PHONES = {}
+def save_phones():
+    tmp = PHONES_JSON + ".tmp"
+    with open(tmp, "w") as f: json.dump(PHONES, f, indent=2)
+    os.replace(tmp, PHONES_JSON)
+    try: os.chmod(PHONES_JSON, 0o600)
+    except Exception: pass
+
+def creds_for_mac(mac):
+    p = PHONES.get(mac)
+    return (p["extension"], p["auth_id"], p["password"]) if p else None
+def mac_for_ext(ext):
+    for mac, p in PHONES.items():
+        if p["extension"] == ext: return mac
+    return None
+
+# ----------------------------- SIP helpers -----------------------------
 def parse(msg):
     head, _, body = msg.partition("\r\n\r\n"); lines = head.split("\r\n"); start = lines[0]; hdrs = {}
     for l in lines[1:]:
@@ -77,10 +123,10 @@ def uri_of(val):
 def parse_auth(h):
     g = lambda p: (re.search(p, h).group(1) if re.search(p, h) else None)
     return g(r'realm="([^"]*)"'), g(r'nonce="([^"]*)"'), g(r'qop="?([a-z,]*)"?'), g(r'opaque="([^"]*)"')
-def digest(method, uri, realm, nonce, qop, cnonce, nc, opaque):
-    ha1 = md5(f"{AUTHID}:{realm}:{PASSWORD}"); ha2 = md5(f"{method}:{uri}")
+def digest(method, uri, realm, nonce, qop, cnonce, nc, opaque, authid, password):
+    ha1 = md5(f"{authid}:{realm}:{password}"); ha2 = md5(f"{method}:{uri}")
     resp = md5(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}") if qop else md5(f"{ha1}:{nonce}:{ha2}")
-    a = f'Digest username="{AUTHID}", realm="{realm}", nonce="{nonce}", uri="{uri}", response="{resp}", algorithm=MD5'
+    a = f'Digest username="{authid}", realm="{realm}", nonce="{nonce}", uri="{uri}", response="{resp}", algorithm=MD5'
     if qop: a += f', qop={qop.split(",")[0]}, nc={nc}, cnonce="{cnonce}"'
     if opaque: a += f', opaque="{opaque}"'
     return a
@@ -99,35 +145,14 @@ def build_bye(leg):
     L += ["Max-Forwards: 70", f"From: {leg['local']};tag={leg['ltag']}", f"To: {leg['remote']}",
           f"Call-ID: {leg['callid']}", f"CSeq: {leg['cseq']} BYE", "User-Agent: ShoreBridge/1.0", "Content-Length: 0"]
     data = ("\r\n".join(L) + "\r\n\r\n").encode()
-    if leg["transport"] == "TLS": phone_send(data)
-    else: u3.sendto(data, SBC)
+    if leg["transport"] == "TLS":
+        c = leg.get("conn")
+        if c:
+            try: c.sendall(data)
+            except Exception: pass
+    else:
+        u3.sendto(data, SBC)
     log(f"sent BYE ({leg['transport']}) callid {leg['callid'][:8]}")
-
-def reg_loop():
-    while True:
-        callid = rid(16) + "@" + MYIP; ftag = rid(8)
-        def mk(cseq, auth=None, hdr="Authorization"):
-            L = [f"REGISTER sip:{DOMAIN} SIP/2.0",
-                 f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch=z9hG4bK{rid(16)};rport", "Max-Forwards: 70",
-                 f"From: <sip:{EXT}@{DOMAIN}>;tag={ftag}", f"To: <sip:{EXT}@{DOMAIN}>",
-                 f"Call-ID: {callid}", f"CSeq: {cseq} REGISTER",
-                 f"Contact: <sip:{EXT}@{MYIP}:{P3CX}>", "Expires: 120", "User-Agent: ShoreBridge/1.0"]
-            if auth: L.append(f"{hdr}: {auth}")
-            L.append("Content-Length: 0"); return "\r\n".join(L) + "\r\n\r\n"
-        with wlock: waiters[callid] = []
-        u3_send(mk(1)); r = wait(callid, 4)
-        if r and (" 401 " in r.split("\r\n")[0] or " 407 " in r.split("\r\n")[0]):
-            st = r.split("\r\n")[0]
-            hh = [l for l in r.split("\r\n") if l.lower().startswith(("www-authenticate", "proxy-authenticate"))]
-            realm, nonce, qop, opaque = parse_auth(hh[0]) if hh else (None,) * 4
-            hdr = "Proxy-Authorization" if " 407 " in st else "Authorization"
-            auth = digest("REGISTER", f"sip:{DOMAIN}", realm, nonce, qop, rid(16), "00000001", opaque)
-            with wlock: waiters[callid] = []
-            u3_send(mk(2, auth, hdr)); r = wait(callid, 4)
-        with wlock: waiters.pop(callid, None)
-        ok = bool(r and " 200 " in r.split("\r\n")[0])
-        log("registration: " + ("OK" if ok else "FAILED"))
-        time.sleep(90 if ok else 15)
 
 def wait(callid, timeout):
     end = time.time() + timeout
@@ -142,16 +167,53 @@ def wait(callid, timeout):
     with wlock:
         q = waiters.get(callid) or []; return q[-1] if q else None
 
+def reg_loop(ext):
+    while True:
+        # resolve current creds for this extension; exit if the phone was removed
+        creds = None
+        with pstate:
+            for mac, p in PHONES.items():
+                if p["extension"] == ext: creds = (p["auth_id"], p["password"]); break
+        if creds is None:
+            with pstate: reg_threads.pop(ext, None); REGOK.pop(ext, None)
+            log(f"registration for ext {ext} stopped (phone removed)"); return
+        authid, password = creds
+        callid = rid(16) + "@" + MYIP; ftag = rid(8)
+        def mk(cseq, auth=None, hdr="Authorization"):
+            L = [f"REGISTER sip:{DOMAIN} SIP/2.0",
+                 f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch=z9hG4bK{rid(16)};rport", "Max-Forwards: 70",
+                 f"From: <sip:{ext}@{DOMAIN}>;tag={ftag}", f"To: <sip:{ext}@{DOMAIN}>",
+                 f"Call-ID: {callid}", f"CSeq: {cseq} REGISTER",
+                 f"Contact: <sip:{ext}@{MYIP}:{P3CX}>", "Expires: 120", "User-Agent: ShoreBridge/1.0"]
+            if auth: L.append(f"{hdr}: {auth}")
+            L.append("Content-Length: 0"); return "\r\n".join(L) + "\r\n\r\n"
+        with wlock: waiters[callid] = []
+        u3_send(mk(1)); r = wait(callid, 4)
+        if r and (" 401 " in r.split("\r\n")[0] or " 407 " in r.split("\r\n")[0]):
+            st = r.split("\r\n")[0]
+            hh = [l for l in r.split("\r\n") if l.lower().startswith(("www-authenticate", "proxy-authenticate"))]
+            realm, nonce, qop, opaque = parse_auth(hh[0]) if hh else (None,) * 4
+            hdr = "Proxy-Authorization" if " 407 " in st else "Authorization"
+            auth = digest("REGISTER", f"sip:{DOMAIN}", realm, nonce, qop, rid(16), "00000001", opaque, authid, password)
+            with wlock: waiters[callid] = []
+            u3_send(mk(2, auth, hdr)); r = wait(callid, 4)
+        with wlock: waiters.pop(callid, None)
+        ok = bool(r and " 200 " in r.split("\r\n")[0])
+        with pstate: REGOK[ext] = ok
+        dbg(f"ext {ext} registration: " + ("OK" if ok else "FAILED"))
+        time.sleep(90 if ok else 15)
+
+def ensure_registrations():
+    with pstate:
+        exts = {p["extension"] for p in PHONES.values()}
+        for ext in exts:
+            if ext not in reg_threads:
+                reg_threads[ext] = True
+                threading.Thread(target=reg_loop, args=(ext,), daemon=True).start()
+                log(f"starting registration for ext {ext}")
+
 CALLS = {}
-PHONE_CONN = None; PHONE_LOCK = threading.Lock()
-PHONE_CONTACT = None; PHONE_IP = None     # learned from the phone's REGISTER
 PIN = {}; pinlock = threading.Lock()
-def phone_send(data):
-    with PHONE_LOCK:
-        if PHONE_CONN:
-            try: PHONE_CONN.sendall(data); return True
-            except Exception: return False
-    return False
 
 def u3_recv():
     while True:
@@ -190,7 +252,7 @@ def resp_line(code, reason, hdrs):
 # ----------------------------- RTP relay -----------------------------
 def alloc_rtp():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    for p in range(12000, 12400, 2):
+    for p in range(12000, 12800, 2):
         try: s.bind((MYIP, p)); return s, p
         except OSError: continue
     s.bind((MYIP, 0)); return s, s.getsockname()[1]
@@ -204,14 +266,14 @@ def sdp_media(sdp):
     return (ip, port) if ip and port else None
 
 class CallSession:
-    def __init__(s, dst, phone_conn, phone_hdrs, phone_sdp):
-        s.dst = dst; s.pc = phone_conn; s.ph = phone_hdrs; s.psdp = phone_sdp
-        s.p_callid = H(phone_hdrs, "call-id")
+    def __init__(s, dst, conn, mac, ext, authid, password):
+        s.dst = dst; s.pc = conn; s.mac = mac
+        s.ext = ext; s.authid = authid; s.password = password
         s.x_callid = rid(16) + "@" + MYIP; s.x_ftag = rid(8); s.x_totag = None
+        s.p_callid = None; s.ph = None
         s.sockP, s.rpP = alloc_rtp(); s.sock3, s.rp3 = alloc_rtp()
-        s.phone_rtp = sdp_media(phone_sdp); s.x_rtp = None
-        s.alive = True
-        s.p_ftag = None; s.p_totag = None; s.p_addr = None
+        s.phone_rtp = None; s.x_rtp = None
+        s.alive = True; s.p_ftag = None; s.p_totag = None; s.p_addr = None
         s.p_dialog = None; s.x_dialog = None
     def on_3cx_response(s, msg): pass
     def on_3cx_request(s, method, hdrs, msg):
@@ -257,14 +319,13 @@ class CallSession:
 def x_invite(cs):
     sdp = ("v=0\r\n" f"o=bridge 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
            f"m=audio {cs.rp3} RTP/AVP 0 101\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:101 telephone-event/8000\r\n" "a=sendrecv\r\n")
-    ftag = cs.x_ftag
     def mk(cseq, branch, auth=None, hdr="Proxy-Authorization"):
         b = sdp.encode()
         L = [f"INVITE sip:{cs.dst}@{DOMAIN} SIP/2.0",
              f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch={branch};rport", "Max-Forwards: 70",
-             f"From: <sip:{EXT}@{DOMAIN}>;tag={ftag}", f"To: <sip:{cs.dst}@{DOMAIN}>",
+             f"From: <sip:{cs.ext}@{DOMAIN}>;tag={cs.x_ftag}", f"To: <sip:{cs.dst}@{DOMAIN}>",
              f"Call-ID: {cs.x_callid}", f"CSeq: {cseq} INVITE",
-             f"Contact: <sip:{EXT}@{MYIP}:{P3CX}>", "User-Agent: ShoreBridge/1.0",
+             f"Contact: <sip:{cs.ext}@{MYIP}:{P3CX}>", "User-Agent: ShoreBridge/1.0",
              "Content-Type: application/sdp", f"Content-Length: {len(b)}"]
         if auth: L.insert(8, f"{hdr}: {auth}")
         return ("\r\n".join(L) + "\r\n\r\n").encode() + b
@@ -277,11 +338,11 @@ def x_invite(cs):
         hh = [l for l in r.split("\r\n") if l.lower().startswith(("www-authenticate", "proxy-authenticate"))]
         realm, nonce, qop, opaque = parse_auth(hh[0]); _, h407, _ = parse(r)
         ack = [f"ACK sip:{cs.dst}@{DOMAIN} SIP/2.0", f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch={b1}",
-               "Max-Forwards: 70", f"From: <sip:{EXT}@{DOMAIN}>;tag={ftag}", f"To: {H(h407,'to')}",
+               "Max-Forwards: 70", f"From: <sip:{cs.ext}@{DOMAIN}>;tag={cs.x_ftag}", f"To: {H(h407,'to')}",
                f"Call-ID: {cs.x_callid}", "CSeq: 1 ACK", "Content-Length: 0"]
         u3.sendto(("\r\n".join(ack) + "\r\n\r\n").encode(), SBC)
         hdr = "Proxy-Authorization" if " 407 " in st else "Authorization"
-        auth = digest("INVITE", f"sip:{cs.dst}@{DOMAIN}", realm, nonce, qop, rid(16), "00000001", opaque)
+        auth = digest("INVITE", f"sip:{cs.dst}@{DOMAIN}", realm, nonce, qop, rid(16), "00000001", opaque, cs.authid, cs.password)
         b2 = "z9hG4bK" + rid(16)
         with wlock: waiters[cs.x_callid] = []
         u3.sendto(mk(2, b2, auth, hdr), SBC)
@@ -310,7 +371,7 @@ def x_ack_ok(resp, cs):
     ruri = uri_of(H(h, "contact")) or f"sip:{cs.dst}@{DOMAIN}"
     L = [f"ACK {ruri} SIP/2.0", f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch=z9hG4bK{rid(16)};rport"]
     for rt in reversed(h.get("record-route", [])): L.append(f"Route: {rt}")
-    L += ["Max-Forwards: 70", f"From: <sip:{EXT}@{DOMAIN}>;tag={cs.x_ftag}", f"To: {to}",
+    L += ["Max-Forwards: 70", f"From: <sip:{cs.ext}@{DOMAIN}>;tag={cs.x_ftag}", f"To: {to}",
           f"Call-ID: {cs.x_callid}", "CSeq: 2 ACK", "Content-Length: 0"]
     u3.sendto(("\r\n".join(L) + "\r\n\r\n").encode(), SBC)
 
@@ -344,10 +405,17 @@ def p_resp(code, reason, hdrs, addr, method, sdp=None):
         return ("\r\n".join(L) + "\r\n\r\n").encode() + b
     L.append("Content-Length: 0"); return ("\r\n".join(L) + "\r\n\r\n").encode()
 
-def phone_invite(conn, hdrs, body, addr):
+def phone_invite(conn, mac, hdrs, body, addr):
     to = H(hdrs, "to"); m = re.search(r'sips?:([^@>]+)@', to); dst = m.group(1) if m else "0"
-    log(f"phone dialed {dst}")
-    cs = CallSession(dst, conn, hdrs, body); cs.p_addr = addr; CALLS[cs.p_callid] = cs
+    creds = creds_for_mac(mac)
+    if not creds:
+        log(f"unconfigured phone {mac} tried to dial {dst}")
+        conn.sendall(p_resp(403, "Forbidden", hdrs, addr, "INVITE")); return
+    ext, authid, password = creds
+    log(f"phone {mac} (ext {ext}) dialed {dst}")
+    cs = CallSession(dst, conn, mac, ext, authid, password)
+    cs.p_callid = H(hdrs, "call-id"); cs.ph = hdrs; cs.p_addr = addr; cs.phone_rtp = sdp_media(body)
+    CALLS[cs.p_callid] = cs; CALLS[cs.x_callid] = cs
     conn.sendall(p_resp(100, "Trying", hdrs, addr, "INVITE"))
     r = x_invite(cs)
     if not r:
@@ -358,21 +426,42 @@ def phone_invite(conn, hdrs, body, addr):
         conn.sendall(p_resp(code if code < 700 else 486, "Declined", hdrs, addr, "INVITE")); cs.teardown(); return
     _, xh, xb = parse(r); cs.x_rtp = sdp_media(xb); cs.x_totag = H(xh, "to"); x_ack_ok(r, cs)
     cs.x_dialog = {'ruri': uri_of(H(xh, "contact")) or f"sip:{dst}@{DOMAIN}", 'transport': 'UDP', 'lport': P3CX,
-                   'local': f"<sip:{EXT}@{DOMAIN}>", 'ltag': cs.x_ftag, 'remote': H(xh, "to"),
+                   'local': f"<sip:{ext}@{DOMAIN}>", 'ltag': cs.x_ftag, 'remote': H(xh, "to"),
                    'callid': cs.x_callid, 'route': list(reversed(xh.get("record-route", []))), 'cseq': 2}
     cs.p_dialog = {'ruri': uri_of(H(hdrs, "contact")) or f"sips:anonymous@{addr[0]}:5061", 'transport': 'TLS', 'lport': 5061,
                    'local': H(hdrs, "to"), 'ltag': mktag(cs.p_callid + "srv"), 'remote': H(hdrs, "from"),
-                   'callid': cs.p_callid, 'route': [], 'cseq': 1}
+                   'callid': cs.p_callid, 'route': [], 'cseq': 1, 'conn': conn}
     threading.Thread(target=cs.relay, daemon=True).start()
     ans = ("v=0\r\n" f"o=switch 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
            f"m=audio {cs.rpP} RTP/AVP 0 102\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:102 telephone-event/8000\r\n" "a=ptime:20\r\n" "a=sendrecv\r\n"
            "m=audio 0 RTP/SAVP 0\r\n")
     conn.sendall(p_resp(200, "OK", hdrs, addr, "INVITE", sdp=ans))
-    log(f"call up: phone <-> {dst}")
+    log(f"call up: ext {ext} <-> {dst}")
+
+def register_phone(conn, hdrs, addr):
+    """Handle a phone REGISTER: identify by MAC, attach connection, auto-provision the first phone."""
+    mac = mac_from_contact(H(hdrs, "contact")) or ("ip-" + addr[0].replace(".", "-"))
+    ct = uri_of(H(hdrs, "contact"))
+    with pstate:
+        CONNS[mac] = conn
+        if ct: CONTACTS[mac] = ct
+        if mac in PHONES:
+            SEEN.pop(mac, None)
+            newprov = False
+        elif not PHONES and DEF_EXT:
+            PHONES[mac] = {"extension": DEF_EXT, "auth_id": DEF_AUTH, "password": DEF_PASS, "label": "auto"}
+            newprov = True
+        else:
+            SEEN[mac] = {"ip": addr[0], "ts": int(time.time())}
+            newprov = None
+    if newprov is True:
+        save_phones(); ensure_registrations(); log(f"auto-provisioned first phone {mac} as ext {DEF_EXT}")
+    elif newprov is None:
+        log(f"unconfigured phone seen: {mac} ({addr[0]}) - assign it in the web UI")
+    return mac
 
 def phone_handle(conn, addr):
-    global PHONE_CONN, PHONE_CONTACT, PHONE_IP
-    PHONE_CONN = conn; buf = b""; conn.settimeout(300)
+    mymac = None; buf = b""; conn.settimeout(300)
     try:
         while True:
             while buf[:2] == b"\r\n": buf = buf[2:]
@@ -405,12 +494,10 @@ def phone_handle(conn, addr):
             method = parts[0]
             if method == "ACK": continue
             if method == "REGISTER":
-                ct = uri_of(H(hdrs, "contact"))
-                if ct: PHONE_CONTACT = ct
-                PHONE_IP = addr[0]
+                mymac = register_phone(conn, hdrs, addr)
                 conn.sendall(p_resp(200, "OK", hdrs, addr, method))
             elif method == "INVITE":
-                threading.Thread(target=phone_invite, args=(conn, hdrs, b, addr), daemon=True).start()
+                threading.Thread(target=phone_invite, args=(conn, mymac, hdrs, b, addr), daemon=True).start()
             elif method == "BYE":
                 cs = CALLS.get(H(hdrs, "call-id"))
                 conn.sendall(p_resp(200, "OK", hdrs, addr, method))
@@ -420,6 +507,9 @@ def phone_handle(conn, addr):
     except Exception as e:
         log(f"phone conn err {repr(e)}")
     finally:
+        if mymac:
+            with pstate:
+                if CONNS.get(mymac) is conn: CONNS.pop(mymac, None)
         try: conn.close()
         except Exception: pass
 
@@ -438,7 +528,7 @@ def cas_handle(conn, addr):
 
 def tls_server(port, handler):
     ctx = tlsctx(); s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("0.0.0.0", port)); s.listen(8); log(f"TLS server on :{port}")
+    s.bind(("0.0.0.0", port)); s.listen(16); log(f"TLS server on :{port}")
     while True:
         c, a = s.accept()
         try:
@@ -451,27 +541,35 @@ def tls_server(port, handler):
 # ----------------------------- inbound: PBX -> phone -----------------------------
 def inbound_invite(xh, xraw, xaddr):
     _, _, xbody = parse(xraw)
-    if not PHONE_CONN or not PHONE_CONTACT:
-        u3.sendto(resp_line(480, "Unavailable", xh).encode(), xaddr); return
-    m = re.search(r'sips?:([^@>;]+)', H(xh, "from")); caller = m.group(1) if m else "unknown"
-    cs = CallSession("inbound", None, xh, xbody)
-    cs.x_hdrs = xh; cs.x_callid = H(xh, "call-id"); cs.x_rtp = sdp_media(xbody)
+    to = H(xh, "to"); m = re.search(r'sips?:([^@>;]+)@', uri_of(to) or to)
+    ext = m.group(1) if m else ""
+    mac = mac_for_ext(ext)
+    conn = CONNS.get(mac) if mac else None
+    if not conn:
+        log(f"inbound for ext {ext}: no phone online"); u3.sendto(resp_line(480, "Unavailable", xh).encode(), xaddr); return
+    fm = re.search(r'sips?:([^@>;]+)', H(xh, "from")); caller = fm.group(1) if fm else "unknown"
+    cs = CallSession("inbound", conn, mac, ext, "", "")
+    cs.x_callid = H(xh, "call-id"); cs.x_rtp = sdp_media(xbody)
     cs.p_callid = rid(16) + "@" + MYIP; cs.p_ftag = rid(8)
     CALLS[cs.x_callid] = cs; CALLS[cs.p_callid] = cs
+    with pstate:
+        contact = CONTACTS.get(mac)
+    phone_uri = contact or f"sips:anonymous@{xaddr_ip(conn)}:5061"
     u3.sendto(resp_line(100, "Trying", xh).encode(), xaddr)
     sdp = ("v=0\r\n" f"o=switch 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
            f"m=audio {cs.rpP} RTP/AVP 0 102\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:102 telephone-event/8000\r\n" "a=ptime:20\r\n" "a=sendrecv\r\n")
     b = sdp.encode()
     inv = ("\r\n".join([
-        f"INVITE {PHONE_CONTACT} SIP/2.0",
+        f"INVITE {phone_uri} SIP/2.0",
         f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)};rport", "Max-Forwards: 70",
-        f"From: <sips:{caller}@{MYIP}>;tag={cs.p_ftag}", f"To: <{PHONE_CONTACT}>",
+        f"From: <sips:{caller}@{MYIP}>;tag={cs.p_ftag}", f"To: <{phone_uri}>",
         f"Call-ID: {cs.p_callid}", "CSeq: 1 INVITE",
         f"Contact: <sips:switch@{MYIP}:5061;transport=tls>", "User-Agent: ShoreBridge/1.0",
         "Content-Type: application/sdp", f"Content-Length: {len(b)}"]) + "\r\n\r\n").encode() + b
     with pinlock: PIN[cs.p_callid] = []
-    log(f"inbound from {caller} -> ringing phone")
-    if not phone_send(inv):
+    log(f"inbound from {caller} -> ext {ext} (ringing phone {mac})")
+    try: conn.sendall(inv)
+    except Exception:
         u3.sendto(resp_line(480, "Unavailable", xh).encode(), xaddr); cs.teardown(); return
     got_ring = False; end = time.time() + 45; final = None
     while time.time() < end and cs.alive:
@@ -491,25 +589,31 @@ def inbound_invite(xh, xraw, xaddr):
         u3.sendto(resp_line(486, "Busy Here", xh).encode(), xaddr); cs.teardown(); return
     _, ph, pb = parse(final); cs.phone_rtp = sdp_media(pb); cs.p_totag = H(ph, "to")
     ack = ("\r\n".join([
-        f"ACK {PHONE_CONTACT} SIP/2.0", f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)}",
+        f"ACK {phone_uri} SIP/2.0", f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)}",
         "Max-Forwards: 70", f"From: <sips:{caller}@{MYIP}>;tag={cs.p_ftag}", f"To: {cs.p_totag}",
         f"Call-ID: {cs.p_callid}", "CSeq: 1 ACK", "Content-Length: 0"]) + "\r\n\r\n").encode()
-    phone_send(ack); threading.Thread(target=cs.relay, daemon=True).start()
+    try: conn.sendall(ack)
+    except Exception: pass
+    threading.Thread(target=cs.relay, daemon=True).start()
     osdp = ("v=0\r\n" f"o=bridge 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
             f"m=audio {cs.rp3} RTP/AVP 0 101\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:101 telephone-event/8000\r\n" "a=sendrecv\r\n")
-    ob = osdp.encode(); to = H(xh, "to")
-    if ";tag=" not in to: to = to + ";tag=" + mktag(cs.x_callid + "in")
-    L = [f"SIP/2.0 200 OK"] + allvia(xh) + allrr(xh) + [f"From: {H(xh,'from')}", f"To: {to}",
+    ob = osdp.encode(); to2 = H(xh, "to")
+    if ";tag=" not in to2: to2 = to2 + ";tag=" + mktag(cs.x_callid + "in")
+    L = [f"SIP/2.0 200 OK"] + allvia(xh) + allrr(xh) + [f"From: {H(xh,'from')}", f"To: {to2}",
          f"Call-ID: {cs.x_callid}", f"CSeq: {H(xh,'cseq')}",
-         f"Contact: <sip:{EXT}@{MYIP}:{P3CX}>", "Content-Type: application/sdp", f"Content-Length: {len(ob)}"]
+         f"Contact: <sip:{ext}@{MYIP}:{P3CX}>", "Content-Type: application/sdp", f"Content-Length: {len(ob)}"]
     u3.sendto(("\r\n".join(L) + "\r\n\r\n").encode() + ob, xaddr)
     cs.x_dialog = {'ruri': uri_of(H(xh, "contact")) or uri_of(H(xh, "from")), 'transport': 'UDP', 'lport': P3CX,
                    'local': H(xh, "to"), 'ltag': mktag(cs.x_callid + "in"), 'remote': H(xh, "from"),
                    'callid': cs.x_callid, 'route': list(reversed(xh.get("record-route", []))), 'cseq': 1}
-    cs.p_dialog = {'ruri': PHONE_CONTACT, 'transport': 'TLS', 'lport': 5061,
+    cs.p_dialog = {'ruri': phone_uri, 'transport': 'TLS', 'lport': 5061,
                    'local': f"<sips:{caller}@{MYIP}>", 'ltag': cs.p_ftag, 'remote': cs.p_totag,
-                   'callid': cs.p_callid, 'route': [], 'cseq': 1}
-    log(f"inbound call up: {caller} <-> phone")
+                   'callid': cs.p_callid, 'route': [], 'cseq': 1, 'conn': conn}
+    log(f"inbound call up: {caller} <-> ext {ext}")
+
+def xaddr_ip(conn):
+    try: return conn.getpeername()[0]
+    except Exception: return MYIP
 
 # ----------------------------- HTTP config/cert server (port 80) -----------------------------
 class QuietHTTP(http.server.SimpleHTTPRequestHandler):
@@ -535,18 +639,111 @@ def http_server():
     log(f"HTTP config server on :80 (root {HTTP_ROOT})")
     httpd.serve_forever()
 
+# ----------------------------- admin web UI (port UI_PORT) -----------------------------
+PAGE = """<!doctype html><html><head><meta charset=utf-8>
+<meta http-equiv=refresh content=8><title>shorebridge</title>
+<style>
+body{{font:15px system-ui,sans-serif;margin:2rem;max-width:820px;color:#222}}
+h1{{font-size:1.4rem}} h2{{font-size:1.05rem;margin-top:1.8rem;color:#444}}
+table{{border-collapse:collapse;width:100%}} td,th{{padding:.45rem .6rem;border-bottom:1px solid #eee;text-align:left}}
+.on{{color:#0a0;font-weight:600}} .off{{color:#999}}
+input{{padding:.35rem;border:1px solid #ccc;border-radius:4px}}
+button{{padding:.35rem .8rem;border:0;border-radius:4px;background:#2563eb;color:#fff;cursor:pointer}}
+button.d{{background:#ddd;color:#333}}
+.card{{background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:1rem;margin:.6rem 0}}
+small{{color:#888}}
+</style></head><body>
+<h1>shorebridge <small>{ip}</small></h1>
+<h2>Configured phones</h2>
+<table><tr><th>MAC</th><th>Extension</th><th>Label</th><th>Online</th><th>Registered</th><th></th></tr>
+{rows}
+</table>
+{discovered}
+<h2>Add / update a phone</h2>
+<form method=post action=/add class=card>
+<table>
+<tr><td>MAC</td><td><input name=mac value="{addmac}" placeholder="00:10:49:54:3b:4c" required></td></tr>
+<tr><td>Extension</td><td><input name=extension required></td></tr>
+<tr><td>Auth ID</td><td><input name=auth_id required></td></tr>
+<tr><td>Password</td><td><input name=password type=password required></td></tr>
+<tr><td>Label</td><td><input name=label placeholder="Front desk"></td></tr>
+</table>
+<p><button type=submit>Save phone</button></p>
+</form>
+<p><small>Edits apply immediately. Config: {cfg}</small></p>
+</body></html>"""
+
+def render():
+    with pstate:
+        rows = []
+        for mac, p in sorted(PHONES.items()):
+            online = mac in CONNS
+            reg = REGOK.get(p["extension"], False)
+            rows.append(
+                f"<tr><td><code>{mac}</code></td><td>{p['extension']}</td><td>{p.get('label','')}</td>"
+                f"<td class={'on' if online else 'off'}>{'online' if online else 'offline'}</td>"
+                f"<td class={'on' if reg else 'off'}>{'yes' if reg else 'no'}</td>"
+                f"<td><form method=post action=/delete style=margin:0>"
+                f"<input type=hidden name=mac value='{mac}'><button class=d>remove</button></form></td></tr>")
+        seen = {m: v for m, v in SEEN.items() if m not in PHONES}
+    rowhtml = "".join(rows) or "<tr><td colspan=6><small>none yet</small></td></tr>"
+    disc = ""; addmac = ""
+    if seen:
+        items = "".join(f"<li><code>{m}</code> ({v['ip']}) "
+                        f"<form method=get style='display:inline'><input type=hidden name=add value='{m}'>"
+                        f"<button>assign &raquo;</button></form></li>" for m, v in sorted(seen.items()))
+        disc = f"<h2>New phones seen (unconfigured)</h2><div class=card><ul>{items}</ul></div>"
+    return rowhtml, disc
+
+class AdminHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        if DEBUG: super().log_message(*a)
+    def _page(self, addmac=""):
+        rowhtml, disc = render()
+        html = PAGE.format(ip=MYIP, rows=rowhtml, discovered=disc, addmac=addmac, cfg=PHONES_JSON)
+        self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+        self.wfile.write(html.encode())
+    def do_GET(self):
+        q = parse_qs(urlparse(self.path).query)
+        self._page(addmac=q.get("add", [""])[0])
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0)); body = self.rfile.read(n).decode()
+        f = {k: v[0] for k, v in parse_qs(body).items()}
+        path = urlparse(self.path).path
+        if path == "/add":
+            mac = norm_mac(f.get("mac", ""))
+            if mac and f.get("extension"):
+                with pstate:
+                    PHONES[mac] = {"extension": f["extension"].strip(), "auth_id": f.get("auth_id", "").strip(),
+                                   "password": f.get("password", ""), "label": f.get("label", "").strip()}
+                    SEEN.pop(mac, None)
+                save_phones(); ensure_registrations(); log(f"UI: saved phone {mac} -> ext {f['extension']}")
+        elif path == "/delete":
+            mac = norm_mac(f.get("mac", ""))
+            with pstate: PHONES.pop(mac, None)
+            save_phones(); log(f"UI: removed phone {mac}")
+        self.send_response(303); self.send_header("Location", "/"); self.end_headers()
+
+def admin_server():
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    httpd = socketserver.ThreadingTCPServer(("0.0.0.0", UI_PORT), AdminHandler)
+    log(f"admin UI on http://{MYIP}:{UI_PORT}")
+    httpd.serve_forever()
+
 # ----------------------------- main -----------------------------
 def main():
     for p in (CERT, KEY, os.path.join(HTTP_ROOT, "keystore", "certs", "hq_ca.crt")):
         if not os.path.exists(p):
-            sys.stderr.write(f"shorebridge: missing {p} (run the installer / generate certs first)\n"); sys.exit(1)
-    log(f"shorebridge starting: bind={MYIP} ext={EXT} pbx={SBC_IP}:{SBC_PORT} domain={DOMAIN}")
+            sys.stderr.write(f"shorebridge: missing {p} (run the installer first)\n"); sys.exit(1)
+    load_phones()
+    log(f"shorebridge starting: bind={MYIP} pbx={SBC_IP}:{SBC_PORT} domain={DOMAIN} phones={len(PHONES)}")
+    ensure_registrations()
     threading.Thread(target=http_server, daemon=True).start()
+    threading.Thread(target=admin_server, daemon=True).start()
     threading.Thread(target=u3_recv, daemon=True).start()
-    threading.Thread(target=reg_loop, daemon=True).start()
     threading.Thread(target=tls_server, args=(5061, phone_handle), daemon=True).start()
     threading.Thread(target=tls_server, args=(5448, cas_handle), daemon=True).start()
-    log("shorebridge ready")
+    log(f"shorebridge ready - admin UI: http://{MYIP}:{UI_PORT}")
     threading.Event().wait()
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ Single process, Python standard library only.
 import socket, ssl, threading, hashlib, random, time, re, os, sys, json, configparser
 import http.server, socketserver, functools
 from urllib.parse import parse_qs, urlparse
+import connectors
 
 # ----------------------------- config -----------------------------
 CFG_PATH = os.environ.get("SHOREBRIDGE_CONFIG", "/etc/shorebridge/config.ini")
@@ -52,6 +53,14 @@ KEY  = os.path.join(DATA, "tls", "switch.key")
 LOGFILE = CFG.get("bridge", "log_file", fallback=os.path.join(DATA, "shorebridge.log"))
 PHONES_JSON = CFG.get("bridge", "phones_file", fallback=os.path.join(os.path.dirname(CFG_PATH), "phones.json"))
 P3CX = 5062  # our local SIP port toward the PBX
+
+# optional connector: a source of extension data (number/name/auth) from the PBX
+CONN_TYPE = CFG.get("connector", "type", fallback="manual")
+CONN_CFG  = dict(CFG.items("connector")) if CFG.has_section("connector") else {}
+connectors.load_dropins(os.path.join(DATA, "connectors.d"))
+CONNECTOR = connectors.make(CONN_TYPE, CONN_CFG)
+CATALOG = []                 # list[connectors.Extension], refreshed in the background
+catalog_lock = threading.Lock()
 
 lock = threading.Lock()
 def log(m):
@@ -645,6 +654,7 @@ button.d{{background:#ddd;color:#333}}
 small{{color:#888}}
 </style></head><body>
 <h1>shorebridge <small>{ip}</small> <a href=/ style="font-size:.8rem;font-weight:400">&#8635; refresh</a></h1>
+<p><small>{connstatus}</small></p>
 <h2>Configured phones</h2>
 <table><tr><th>MAC</th><th>Extension</th><th>Label</th><th>Online</th><th>Registered</th><th></th></tr>
 {rows}
@@ -654,10 +664,11 @@ small{{color:#888}}
 <form method=post action=/add class=card>
 <table>
 <tr><td>MAC</td><td><input name=mac value="{addmac}" placeholder="00:10:49:54:3b:4c" required></td></tr>
-<tr><td>Extension</td><td><input name=extension required></td></tr>
-<tr><td>Auth ID</td><td><input name=auth_id required></td></tr>
-<tr><td>Password</td><td><input name=password type=password required></td></tr>
-<tr><td>Label</td><td><input name=label placeholder="Front desk"></td></tr>
+{catalog}
+<tr><td>Extension</td><td><input name=extension placeholder="number"></td></tr>
+<tr><td>Auth ID</td><td><input name=auth_id placeholder="(blank = same as extension)"></td></tr>
+<tr><td>Password</td><td><input name=password type=password></td></tr>
+<tr><td>Label / name</td><td><input name=label placeholder="Front desk"></td></tr>
 </table>
 <p><button type=submit>Save phone</button></p>
 </form>
@@ -686,20 +697,33 @@ def render():
                 f"<input type=hidden name=mac value='{mac}'><button class=d>remove</button></form></td></tr>")
         seen = {m: v for m, v in SEEN.items() if m not in PHONES}
     rowhtml = "".join(rows) or "<tr><td colspan=6><small>none yet</small></td></tr>"
-    disc = ""; addmac = ""
+    disc = ""
     if seen:
         items = "".join(f"<li><code>{m}</code> ({v['ip']}) "
                         f"<form method=get style='display:inline'><input type=hidden name=add value='{m}'>"
                         f"<button>assign &raquo;</button></form></li>" for m, v in sorted(seen.items()))
         disc = f"<h2>New phones seen (unconfigured)</h2><div class=card><ul>{items}</ul></div>"
-    return rowhtml, disc
+    with catalog_lock: cat = list(CATALOG)
+    if cat:
+        opts = "".join(f"<option value='{e.number}'>{e.number} &mdash; {e.display_name}</option>" for e in cat)
+        catalog = ("<tr><td>PBX extension</td><td><select name=catalog_ext>"
+                   "<option value=''>&mdash; pick from PBX &mdash;</option>" + opts +
+                   "</select> <small>or fill in manually below</small></td></tr>")
+        connstatus = f"Connector: {CONN_TYPE} &mdash; {len(cat)} extensions from {CONNECTOR.status()}"
+    else:
+        catalog = ""
+        connstatus = (f"Connector: {CONN_TYPE} (no catalog &mdash; enter credentials manually)"
+                      if CONN_TYPE == "manual" else
+                      f"Connector: {CONN_TYPE} &mdash; no extensions returned (check [connector] config)")
+    return rowhtml, disc, catalog, connstatus
 
 class AdminHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         if DEBUG: super().log_message(*a)
     def _page(self, addmac=""):
-        rowhtml, disc = render()
-        html = PAGE.format(ip=MYIP, rows=rowhtml, discovered=disc, addmac=addmac, cfg=PHONES_JSON)
+        rowhtml, disc, catalog, connstatus = render()
+        html = PAGE.format(ip=MYIP, rows=rowhtml, discovered=disc, addmac=addmac,
+                           cfg=PHONES_JSON, catalog=catalog, connstatus=connstatus)
         self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
         self.wfile.write(html.encode())
     def do_GET(self):
@@ -711,12 +735,22 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/add":
             mac = norm_mac(f.get("mac", ""))
-            if mac and f.get("extension"):
+            pick = f.get("catalog_ext", "").strip()
+            rec = None
+            if pick:
+                with catalog_lock:
+                    rec = next((e for e in CATALOG if e.number == pick), None)
+            ext = f.get("extension", "").strip() or (rec.number if rec else "")
+            authid = f.get("auth_id", "").strip() or (rec.auth_id if rec else ext)
+            password = f.get("password", "") or (rec.password if rec else "")
+            label = f.get("label", "").strip() or (rec.display_name if rec else "")
+            if mac and ext and password:
                 with pstate:
-                    PHONES[mac] = {"extension": f["extension"].strip(), "auth_id": f.get("auth_id", "").strip(),
-                                   "password": f.get("password", ""), "label": f.get("label", "").strip()}
+                    PHONES[mac] = {"extension": ext, "auth_id": authid, "password": password, "label": label}
                     SEEN.pop(mac, None)
-                save_phones(); ensure_registrations(); log(f"UI: saved phone {mac} -> ext {f['extension']}")
+                save_phones(); ensure_registrations(); log(f"UI: saved phone {mac} -> ext {ext}")
+            else:
+                log(f"UI: incomplete add for {mac} (need extension + password)")
         elif path == "/delete":
             mac = norm_mac(f.get("mac", ""))
             with pstate: PHONES.pop(mac, None)
@@ -729,6 +763,17 @@ def admin_server():
     log(f"admin UI on http://{MYIP}:{UI_PORT}")
     httpd.serve_forever()
 
+def refresh_catalog():
+    global CATALOG
+    while True:
+        try:
+            exts = CONNECTOR.list_extensions()
+            with catalog_lock: CATALOG = exts
+            if exts: dbg(f"connector {CONN_TYPE}: {len(exts)} extensions ({CONNECTOR.status()})")
+        except Exception as e:
+            log("connector refresh err: " + repr(e))
+        time.sleep(300)
+
 # ----------------------------- main -----------------------------
 def main():
     for p in (CERT, KEY, os.path.join(HTTP_ROOT, "keystore", "certs", "hq_ca.crt")):
@@ -737,6 +782,7 @@ def main():
     load_phones()
     log(f"shorebridge starting: bind={MYIP} pbx={SBC_IP}:{SBC_PORT} domain={DOMAIN} phones={len(PHONES)}")
     ensure_registrations()
+    threading.Thread(target=refresh_catalog, daemon=True).start()
     threading.Thread(target=http_server, daemon=True).start()
     threading.Thread(target=admin_server, daemon=True).start()
     threading.Thread(target=u3_recv, daemon=True).start()

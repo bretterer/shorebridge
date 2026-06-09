@@ -70,6 +70,39 @@ Point a new phone's Config Server at the bridge; it shows up in the UI under **"
 
 `/etc/shorebridge/config.ini` (see [`config.example.ini`](config.example.ini)). Edit and `systemctl restart shorebridge`. Logs: `journalctl -u shorebridge -f`.
 
+## Connectors (optional)
+
+By default you type each phone's extension/auth/password into the UI. A **connector** lets shorebridge pull that from your PBX's own source of truth, so the UI shows a **dropdown of real extensions** instead (credentials are resolved server-side and never sent to the browser). Calls never depend on a connector being reachable, resolved credentials are persisted to `phones.json`.
+
+Configure in `config.ini`:
+
+```ini
+[connector]
+type = 3cx
+api_base = https://yourpbx.3cx.cloud   ; the 3CX MANAGEMENT instance, not the SBC
+token    = <admin API bearer token>
+```
+
+`type = manual` (default) means no catalog. A `3cx` connector ships in the box.
+
+### Write a connector
+
+Connectors implement a tiny interface, so adding support for FreePBX, NetSapiens, etc. is a single file. Subclass `Connector`, implement `list_extensions()`, register it:
+
+```python
+from connectors import Connector, Extension, register
+
+@register
+class MyPBXConnector(Connector):
+    type = "mypbx"
+    label = "My PBX"
+    def list_extensions(self):
+        # fetch from your PBX API; return Extension(number, display_name, auth_id, password)
+        return [Extension("100", "Front Desk", "100", "secret")]
+```
+
+Add it to `connectors.py` (PR welcome) or drop the file into `/opt/shorebridge/connectors.d/` for a private connector, no fork needed. It auto-registers at startup and appears as a `type` option.
+
 ## Limitations / roadmap
 
 Calls and multi-phone work. The remaining items are the proprietary `uaCSTA` "feels native" layer (all pushed from the switch over the same channel):

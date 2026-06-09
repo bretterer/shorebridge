@@ -81,10 +81,13 @@ mkdir -p "$PREFIX/tls" "$PREFIX/www/keystore/certs" "$PREFIX/www/fileserver/phon
 # program (prefer local copy when run from a clone, else download)
 if [ -f "$SCRIPT_DIR/shorebridge.py" ]; then
   install -m 0755 "$SCRIPT_DIR/shorebridge.py" "$PREFIX/shorebridge.py"
+  install -m 0644 "$SCRIPT_DIR/connectors.py" "$PREFIX/connectors.py"
 else
   curl -fsSL "$RAW_BASE/shorebridge.py" -o "$PREFIX/shorebridge.py"; chmod 0755 "$PREFIX/shorebridge.py"
+  curl -fsSL "$RAW_BASE/connectors.py"  -o "$PREFIX/connectors.py"
 fi
-ok "shorebridge.py"
+mkdir -p "$PREFIX/connectors.d"   # drop third-party connector .py files here
+ok "shorebridge.py + connectors"
 
 # ---- certificates: our own CA + a switch cert the phone will trust ----
 c "Generating certificates (CA injection trust anchor)"
@@ -122,6 +125,9 @@ domain   = $DOMAIN
 
 [phone]
 timezone = $TZ
+
+[connector]
+type = manual
 EOF
 chmod 600 "$ETC/config.ini"
 ok "wrote $ETC/config.ini"

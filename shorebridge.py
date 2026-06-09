@@ -632,8 +632,7 @@ def http_server():
     httpd.serve_forever()
 
 # ----------------------------- admin web UI (port UI_PORT) -----------------------------
-PAGE = """<!doctype html><html><head><meta charset=utf-8>
-<meta http-equiv=refresh content=8><title>shorebridge</title>
+PAGE = """<!doctype html><html><head><meta charset=utf-8><title>shorebridge</title>
 <style>
 body{{font:15px system-ui,sans-serif;margin:2rem;max-width:820px;color:#222}}
 h1{{font-size:1.4rem}} h2{{font-size:1.05rem;margin-top:1.8rem;color:#444}}
@@ -645,7 +644,7 @@ button.d{{background:#ddd;color:#333}}
 .card{{background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:1rem;margin:.6rem 0}}
 small{{color:#888}}
 </style></head><body>
-<h1>shorebridge <small>{ip}</small></h1>
+<h1>shorebridge <small>{ip}</small> <a href=/ style="font-size:.8rem;font-weight:400">&#8635; refresh</a></h1>
 <h2>Configured phones</h2>
 <table><tr><th>MAC</th><th>Extension</th><th>Label</th><th>Online</th><th>Registered</th><th></th></tr>
 {rows}
@@ -663,6 +662,14 @@ small{{color:#888}}
 <p><button type=submit>Save phone</button></p>
 </form>
 <p><small>Edits apply immediately. Config: {cfg}</small></p>
+<script>
+// auto-refresh to surface newly-seen phones, but never while you're typing in a field
+setInterval(function(){{
+  var a=document.activeElement;
+  if(a && (a.tagName=='INPUT'||a.tagName=='SELECT'||a.tagName=='TEXTAREA')) return;
+  location.reload();
+}}, 8000);
+</script>
 </body></html>"""
 
 def render():

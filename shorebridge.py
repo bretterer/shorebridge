@@ -282,7 +282,7 @@ class CallSession:
         s.sockP, s.rpP = alloc_rtp(); s.sock3, s.rp3 = alloc_rtp()
         s.phone_rtp = None; s.x_rtp = None
         s.alive = True; s.p_ftag = None; s.p_totag = None; s.p_addr = None
-        s.p_dialog = None; s.x_dialog = None
+        s.p_dialog = None; s.x_dialog = None; s.p_inv = None
     def on_3cx_response(s, msg): pass
     def on_3cx_request(s, method, hdrs, msg):
         if method in ("BYE", "CANCEL"): s.teardown(origin="3cx")
@@ -311,9 +311,20 @@ class CallSession:
     def teardown(s, origin=None):
         if not s.alive: return
         s.alive = False
-        if origin != "phone" and s.p_dialog:
-            try: build_bye(s.p_dialog)
-            except Exception as e: log("bye phone err " + repr(e))
+        if origin != "phone":
+            if s.p_dialog:                      # call was answered -> BYE
+                try: build_bye(s.p_dialog)
+                except Exception as e: log("bye phone err " + repr(e))
+            elif s.p_inv:                        # phone still ringing -> CANCEL its INVITE
+                try:
+                    iv = s.p_inv
+                    L = [f"CANCEL {iv['contact']} SIP/2.0",
+                         f"Via: SIP/2.0/TLS {MYIP}:5061;branch={iv['branch']};rport", "Max-Forwards: 70",
+                         f"From: {iv['from']}", f"To: <{iv['contact']}>",
+                         f"Call-ID: {iv['callid']}", "CSeq: 1 CANCEL", "Content-Length: 0"]
+                    iv["conn"].sendall(("\r\n".join(L) + "\r\n\r\n").encode())
+                    log("sent CANCEL to phone (caller hung up before answer)")
+                except Exception as e: log("cancel phone err " + repr(e))
         if origin != "3cx" and s.x_dialog:
             try: build_bye(s.x_dialog)
             except Exception as e: log("bye pbx err " + repr(e))
@@ -561,10 +572,12 @@ def inbound_invite(xh, xraw, xaddr):
     u3.sendto(resp_line(100, "Trying", xh).encode(), xaddr)
     sdp = ("v=0\r\n" f"o=switch 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
            f"m=audio {cs.rpP} RTP/AVP 0 102\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:102 telephone-event/8000\r\n" "a=ptime:20\r\n" "a=sendrecv\r\n")
-    b = sdp.encode()
+    b = sdp.encode(); pbranch = "z9hG4bK" + rid(16)
+    cs.p_inv = {"branch": pbranch, "contact": phone_uri,
+                "from": f"<sips:{caller}@{MYIP}>;tag={cs.p_ftag}", "callid": cs.p_callid, "conn": conn}
     inv = ("\r\n".join([
         f"INVITE {phone_uri} SIP/2.0",
-        f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)};rport", "Max-Forwards: 70",
+        f"Via: SIP/2.0/TLS {MYIP}:5061;branch={pbranch};rport", "Max-Forwards: 70",
         f"From: <sips:{caller}@{MYIP}>;tag={cs.p_ftag}", f"To: <{phone_uri}>",
         f"Call-ID: {cs.p_callid}", "CSeq: 1 INVITE",
         f"Contact: <sips:switch@{MYIP}:5061;transport=tls>", "User-Agent: ShoreBridge/1.0",

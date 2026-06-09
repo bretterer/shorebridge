@@ -3,13 +3,13 @@
 # shorebridge installer.
 #
 # One-line install (Debian / Raspberry Pi OS, run as root):
-#   sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/USER/shorebridge/main/install.sh)"
+#   sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/bretterer/shorebridge/main/install.sh)"
 #
 # Re-running is safe: it updates the program and (with --reconfigure) the settings.
 #
 set -euo pipefail
 
-RAW_BASE="${SB_RAW_BASE:-https://raw.githubusercontent.com/USER/shorebridge/main}"
+RAW_BASE="${SB_RAW_BASE:-https://raw.githubusercontent.com/bretterer/shorebridge/main}"
 PREFIX=/opt/shorebridge
 ETC=/etc/shorebridge
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo /tmp)"

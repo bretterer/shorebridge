@@ -35,7 +35,7 @@ The phone validates the switch's TLS cert against a CA it **downloads at boot** 
 On the Linux host, as root:
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/USER/shorebridge/main/install.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/bretterer/shorebridge/main/install.sh)"
 ```
 
 It checks prerequisites, optionally installs the 3CX SBC if missing, asks for your PBX details, generates the trust CA + switch cert, writes the config, and starts `shorebridge` as a systemd service.
@@ -43,7 +43,7 @@ It checks prerequisites, optionally installs the 3CX SBC if missing, asks for yo
 Or from a clone:
 
 ```bash
-git clone https://github.com/USER/shorebridge && cd shorebridge
+git clone https://github.com/bretterer/shorebridge && cd shorebridge
 sudo ./install.sh
 ```
 

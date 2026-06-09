@@ -48,10 +48,8 @@ fi
 ok "python3 $(python3 -c 'import platform;print(platform.python_version())'), openssl present"
 
 # ---- detect 3CX SBC (optional coexistence) ----
-if systemctl list-unit-files 2>/dev/null | grep -qi '3cxsbc'; then
+if systemctl is-active --quiet 3cxsbc 2>/dev/null || [ -x /usr/sbin/3cxsbc ] || dpkg -s 3cxsbc >/dev/null 2>&1; then
   ok "3CX SBC detected on this host"
-elif [ -d /opt/3cxsbc ] || command -v 3CXSBC >/dev/null 2>&1; then
-  ok "3CX SBC detected"
 else
   warn "No 3CX SBC found on this host."
   ask "  Install the 3CX SBC now? (y/N)" "N" INSTALL_SBC

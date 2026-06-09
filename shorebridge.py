@@ -502,9 +502,23 @@ def phone_handle(conn, addr):
             if DEBUG:   # full capture of the phone->switch channel (uaCSTA dialog, bodies)
                 dbg("PHONE >>>>\n" + msg.strip() + "\n<<<< end")
             if start.startswith("SIP/2.0"):
+                cid = H(hdrs, "call-id")
                 with pinlock:
-                    cid = H(hdrs, "call-id")
                     if cid in PIN: PIN[cid].append(msg)
+                # ACK a non-2xx final response to an INVITE we sent the phone (e.g. 487 after CANCEL),
+                # else the phone's transaction hangs and it loses dial tone.
+                try: code = int(parts[1])
+                except Exception: code = 0
+                if code >= 300 and "INVITE" in H(hdrs, "cseq"):
+                    cs = CALLS.get(cid)
+                    if cs and getattr(cs, "p_inv", None):
+                        iv = cs.p_inv; cseqn = H(hdrs, "cseq").split()[0]
+                        ack = [f"ACK {iv['contact']} SIP/2.0",
+                               f"Via: SIP/2.0/TLS {MYIP}:5061;branch={iv['branch']}", "Max-Forwards: 70",
+                               f"From: {iv['from']}", f"To: {H(hdrs,'to')}",
+                               f"Call-ID: {cid}", f"CSeq: {cseqn} ACK", "Content-Length: 0"]
+                        try: conn.sendall(("\r\n".join(ack) + "\r\n\r\n").encode())
+                        except Exception: pass
                 continue
             method = parts[0]
             if method == "ACK": continue

@@ -1,0 +1,18 @@
+[Unit]
+Description=shorebridge - ShoreTel/Mitel IP480 to SIP bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/shorebridge/shorebridge.py
+Environment=SHOREBRIDGE_CONFIG=/etc/shorebridge/config.ini
+Restart=always
+RestartSec=3
+# Needs privileged ports 80 (config server) and 5061/5448 (TLS). Running as root
+# is simplest; to drop privileges instead, grant CAP_NET_BIND_SERVICE and set User=.
+User=root
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

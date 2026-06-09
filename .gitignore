@@ -1,0 +1,13 @@
+# runtime artifacts / secrets - never commit these
+*.log
+*.key
+*.crt
+*.csr
+*.pem
+*.srl
+config.ini
+tls/
+www/
+__pycache__/
+*.pyc
+.DS_Store

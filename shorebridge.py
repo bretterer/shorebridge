@@ -46,6 +46,7 @@ DATA     = CFG.get("bridge", "data_dir", fallback="/opt/shorebridge")
 TZ       = CFG.get("phone", "timezone", fallback="Eastern Standard Time")
 DEBUG    = CFG.getboolean("bridge", "debug", fallback=False)
 UI_PORT  = CFG.getint("bridge", "ui_port", fallback=8910)
+CSTA_AUTOANSWER = CFG.getboolean("bridge", "csta_test_autoanswer", fallback=False)  # test: auto-fire AnswerCall on inbound ring
 
 HTTP_ROOT = os.path.join(DATA, "www")
 CERT = os.path.join(DATA, "tls", "switch_fullchain.crt")
@@ -587,6 +588,13 @@ def inbound_invite(xh, xraw, xaddr):
     try: conn.sendall(inv)
     except Exception:
         u3.sendto(resp_line(480, "Unavailable", xh).encode(), xaddr); cs.teardown(); return
+    if CSTA_AUTOANSWER:   # test mode: fire AnswerCall ~3s into the ring to prove it answers
+        def _autoanswer():
+            time.sleep(3)
+            if cs.alive and not cs.p_totag:
+                log("CSTA test: auto-firing AnswerCall")
+                send_to_phone_csta(mac, csta_preset("answercall", "", dev=mac_colon(mac)))
+        threading.Thread(target=_autoanswer, daemon=True).start()
     got_ring = False; end = time.time() + 45; final = None
     while time.time() < end and cs.alive:
         with pinlock: q = list(PIN.get(cs.p_callid, []))

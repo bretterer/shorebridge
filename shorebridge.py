@@ -618,6 +618,47 @@ def xaddr_ip(conn):
     try: return conn.getpeername()[0]
     except Exception: return MYIP
 
+# ----------------------------- uaCSTA experiment harness -----------------------------
+# Send a CSTA service request DOWN to a phone over its existing TLS connection
+# (NOTIFY Event: uaCSTA + application/csta+xml). Returns the phone's reply so we can
+# see whether it accepts the service (200 OK + CSTA response) or rejects it.
+ED = "http://www.ecma-international.org/standards/ecma-323/csta/ed4"
+def csta_preset(kind, ext, text=""):
+    if kind == "answercall":
+        return f'<AnswerCall xmlns="{ED}"><callToBeAnswered><deviceID>{ext}</deviceID></callToBeAnswered></AnswerCall>'
+    if kind == "offhook":
+        return f'<SetHookswitchStatus xmlns="{ED}"><device>{ext}</device><hookswitch>1</hookswitch><hookswitchOnHook>false</hookswitchOnHook></SetHookswitchStatus>'
+    if kind == "setdisplay":
+        return f'<SetDisplay xmlns="{ED}"><device>{ext}</device><contentsOfDisplay>{text}</contentsOfDisplay></SetDisplay>'
+    return text  # raw
+
+def send_to_phone_csta(mac, body):
+    conn = CONNS.get(mac); contact = CONTACTS.get(mac)
+    if not conn or not contact:
+        return "(phone not connected)"
+    callid = rid(16) + "@" + MYIP; b = body.encode()
+    msg = ("\r\n".join([
+        f"NOTIFY {contact} SIP/2.0",
+        f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)};rport", "Max-Forwards: 70",
+        f"From: <sips:switch@{MYIP}>;tag={rid(8)}", f"To: <{contact}>",
+        f"Call-ID: {callid}", "CSeq: 1 NOTIFY",
+        "Event: uaCSTA", "Subscription-State: active",
+        "Content-Type: application/csta+xml", f"Content-Length: {len(b)}"]) + "\r\n\r\n").encode() + b
+    with pinlock: PIN[callid] = []
+    log(f"CSTA >> phone {mac}:\n{body}")
+    try: conn.sendall(msg)
+    except Exception as e:
+        with pinlock: PIN.pop(callid, None)
+        return f"(send error: {e})"
+    end = time.time() + 5; out = None
+    while time.time() < end:
+        with pinlock: q = list(PIN.get(callid, []))
+        if q: out = q[-1]; break
+        time.sleep(0.05)
+    with pinlock: PIN.pop(callid, None)
+    if out: log(f"CSTA << phone {mac}:\n{out.strip()}")
+    return out or "(no reply from phone in 5s)"
+
 # ----------------------------- HTTP config/cert server (port 80) -----------------------------
 class QuietHTTP(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a):
@@ -735,6 +776,13 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0)); body = self.rfile.read(n).decode()
         f = {k: v[0] for k, v in parse_qs(body).items()}
         path = urlparse(self.path).path
+        if path == "/debug/csta" and DEBUG:
+            mac = norm_mac(f.get("mac", ""))
+            kind = f.get("kind", "raw")
+            xml = csta_preset(kind, f.get("ext", ""), f.get("text", "")) if kind != "raw" else f.get("body", "")
+            reply = send_to_phone_csta(mac, xml)
+            self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
+            self.wfile.write(("SENT:\n" + xml + "\n\nREPLY:\n" + (reply or "")).encode()); return
         if path == "/add":
             mac = norm_mac(f.get("mac", ""))
             pick = f.get("catalog_ext", "").strip()

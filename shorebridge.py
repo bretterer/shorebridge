@@ -12,8 +12,9 @@ thinks we are normal SIP extensions.
 
 Multi-phone: each physical phone (identified by the MAC it sends in its registration)
 maps to its own PBX extension. Mappings live in phones.json and are managed from a
-small web UI on :8910. The first phone to connect auto-provisions itself from the
-[pbx] defaults in config.ini, so a single-phone install works with zero UI steps.
+small web UI on :8910 - point a phone at the bridge, it appears there as "seen",
+assign it an extension + auth, done. The installer only configures the PBX
+connection; per-phone credentials are never in config.ini.
 
 Single process, Python standard library only.
 """
@@ -37,10 +38,6 @@ SBC_IP   = CFG.get("pbx", "sbc_ip")
 SBC_PORT = CFG.getint("pbx", "sbc_port", fallback=5060)
 SBC      = (SBC_IP, SBC_PORT)
 DOMAIN   = CFG.get("pbx", "domain")
-# [pbx] extension/auth/password are the "default profile" the first phone auto-claims.
-DEF_EXT  = CFG.get("pbx", "extension", fallback="")
-DEF_AUTH = CFG.get("pbx", "auth_id", fallback="")
-DEF_PASS = CFG.get("pbx", "password", fallback="")
 
 _bind    = CFG.get("bridge", "bind_ip", fallback="auto").strip()
 MYIP     = detect_ip(SBC_IP) if _bind in ("", "auto") else _bind
@@ -439,25 +436,18 @@ def phone_invite(conn, mac, hdrs, body, addr):
     log(f"call up: ext {ext} <-> {dst}")
 
 def register_phone(conn, hdrs, addr):
-    """Handle a phone REGISTER: identify by MAC, attach connection, auto-provision the first phone."""
+    """Handle a phone REGISTER: identify by MAC, attach its connection; unknown MACs go to SEEN for the UI."""
     mac = mac_from_contact(H(hdrs, "contact")) or ("ip-" + addr[0].replace(".", "-"))
     ct = uri_of(H(hdrs, "contact"))
     with pstate:
         CONNS[mac] = conn
         if ct: CONTACTS[mac] = ct
         if mac in PHONES:
-            SEEN.pop(mac, None)
-            newprov = False
-        elif not PHONES and DEF_EXT:
-            PHONES[mac] = {"extension": DEF_EXT, "auth_id": DEF_AUTH, "password": DEF_PASS, "label": "auto"}
-            newprov = True
+            SEEN.pop(mac, None); known = True
         else:
-            SEEN[mac] = {"ip": addr[0], "ts": int(time.time())}
-            newprov = None
-    if newprov is True:
-        save_phones(); ensure_registrations(); log(f"auto-provisioned first phone {mac} as ext {DEF_EXT}")
-    elif newprov is None:
-        log(f"unconfigured phone seen: {mac} ({addr[0]}) - assign it in the web UI")
+            SEEN[mac] = {"ip": addr[0], "ts": int(time.time())}; known = False
+    if not known:
+        log(f"unconfigured phone seen: {mac} ({addr[0]}) - assign it at http://{MYIP}:{UI_PORT}")
     return mac
 
 def phone_handle(conn, addr):

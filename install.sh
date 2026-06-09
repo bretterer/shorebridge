@@ -71,11 +71,8 @@ ask "Bridge LAN IP (phones point here)" "${DEF_IP:-auto}" BIND_IP
 ask "PBX / 3CX SBC IP (same box as SBC? use this host's LAN IP)" "$BIND_IP" SBC_IP
 ask "PBX SIP port"                      "5060"             SBC_PORT
 ask "Registrar domain (3CX: NNN.3cx.cloud; FreePBX: PBX IP)" "$SBC_IP" DOMAIN
-ask "Extension number"                  "100"              EXT
-ask "Authentication ID"                 "$EXT"             AUTHID
-ask "Authentication password"           ""                 PASSWORD secret
 ask "Phone timezone"                    "Eastern Standard Time" TZ
-[ -n "$PASSWORD" ] || die "password is required"
+# Per-phone extension/auth/password are assigned later in the web UI, not here.
 
 # ---- lay out files ----
 echo; c "Installing to $PREFIX"
@@ -122,9 +119,6 @@ ui_port = 8910
 sbc_ip   = $SBC_IP
 sbc_port = $SBC_PORT
 domain   = $DOMAIN
-extension = $EXT
-auth_id   = $AUTHID
-password  = $PASSWORD
 
 [phone]
 timezone = $TZ
@@ -161,10 +155,12 @@ cat <<EOF
     3. Set Config Server to:  $BIND_IP
     4. Reboot / save:  Mute + 73738#
 
-  The first phone to connect auto-claims extension $EXT. Add more phones
-  (by MAC) from the web UI:
+  Now add your phones (by MAC, with their PBX extension + auth) in the web UI:
 
     http://$BIND_IP:8910
+
+  Point a phone's Config Server at $BIND_IP; it will appear there under
+  "New phones seen" for one-click assignment.
 
   Logs:    journalctl -u shorebridge -f
   Config:  $ETC/config.ini   (edit then: systemctl restart shorebridge)

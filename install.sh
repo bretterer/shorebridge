@@ -19,8 +19,8 @@ ok() { printf "  \033[1;32m✓\033[0m %s\n" "$*"; }
 warn(){ printf "  \033[1;33m!\033[0m %s\n" "$*"; }
 die(){ printf "\033[1;31mERROR:\033[0m %s\n" "$*" >&2; exit 1; }
 ask(){ # ask <prompt> <default> <varname>  (reads from the terminal even under curl|bash)
-  local p="$1" d="$2" __v="$3" ans
-  if [ -n "${!__v:-}" ]; then printf -v "$__v" '%s' "${!__v}"; return; fi
+  local p="$1" d="$2" __v="$3" envname="SB_$3" ans
+  if [ -n "${!envname:-}" ]; then printf -v "$__v" '%s' "${!envname}"; return; fi  # non-interactive override: SB_<VAR>
   read -r -p "$p [${d}]: " ans </dev/tty || ans=""
   printf -v "$__v" '%s' "${ans:-$d}"
 }
@@ -66,7 +66,7 @@ echo; c "Configuration"
 DEF_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1);exit}}')"
 [ -n "$DEF_IP" ] || DEF_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 ask "Bridge LAN IP (phones point here)" "${DEF_IP:-auto}" BIND_IP
-ask "PBX / 3CX SBC IP"                  "127.0.0.1"        SBC_IP
+ask "PBX / 3CX SBC IP (same box as SBC? use this host's LAN IP)" "$BIND_IP" SBC_IP
 ask "PBX SIP port"                      "5060"             SBC_PORT
 ask "Registrar domain (3CX: NNN.3cx.cloud; FreePBX: PBX IP)" "$SBC_IP" DOMAIN
 ask "Extension number"                  "100"              EXT

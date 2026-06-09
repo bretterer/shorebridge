@@ -543,14 +543,35 @@ def phone_handle(conn, addr):
         except Exception: pass
 
 def cas_handle(conn, addr):
+    # CAS = ShoreTel Client Application Server (HTTPS). The phone fetches its own
+    # extension name + the directory/history here. We log requests (debug) and stub 200 OK.
     try:
-        conn.settimeout(20); buf = b""
+        conn.settimeout(30); buf = b""
         while b"\r\n\r\n" not in buf:
             d = conn.recv(4096)
             if not d: break
             buf += d
-        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
-    except Exception: pass
+        if not buf: return
+        head, _, rest = buf.partition(b"\r\n\r\n")
+        htext = head.decode("utf-8", "replace")
+        cl = 0
+        for line in htext.split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                try: cl = int(line.split(":", 1)[1].strip() or 0)
+                except Exception: cl = 0
+        while len(rest) < cl:
+            d = conn.recv(4096)
+            if not d: break
+            rest += d
+        reqline = htext.split("\r\n")[0]
+        log(f"CAS req: {reqline}")
+        if DEBUG:
+            body = rest[:cl].decode("utf-8", "replace")
+            log("CAS REQUEST >>>>\n" + htext + (("\n\n" + body) if body else "") + "\n<<<< end")
+        ok = b'{"Status":"OK"}'
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(ok), ok))
+    except Exception as e:
+        if DEBUG: log("CAS err " + repr(e))
     finally:
         try: conn.close()
         except Exception: pass

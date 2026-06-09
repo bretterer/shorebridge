@@ -50,9 +50,9 @@ sudo ./install.sh
 ## Point a phone at it
 
 1. Factory reset: `Mute` + `25327#`
-2. Setup menu: `Mute` + `73887#` (admin password `1234`)
+2. As the phone reboots, **press any key when it prompts you** to interrupt boot and enter the setup menu (or from the idle screen use `Mute` + `73887#`, admin password `1234`)
 3. Set **Config Server** to the bridge's IP
-4. Reboot: `Mute` + `73738#`
+4. Reboot / save: `Mute` + `73738#`
 
 The phone pulls its config + trust cert, registers over TLS, and shows up on your PBX as your extension. Place and receive calls normally. (Answer incoming calls with the **Answer softkey / Speaker button**, see Limitations.)
 

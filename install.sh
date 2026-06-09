@@ -153,9 +153,10 @@ cat <<EOF
 
   Point each ShoreTel/Mitel IP480 at this bridge:
     1. Factory reset:  Mute + 25327#
-    2. Setup menu:     Mute + 73887#   (admin password 1234)
+    2. As it reboots, press any key when prompted to enter setup
+       (or from idle:  Mute + 73887#, admin password 1234)
     3. Set Config Server to:  $BIND_IP
-    4. Reboot:         Mute + 73738#
+    4. Reboot / save:  Mute + 73738#
 
   The phone will pull its config + trust cert from this host, register over TLS,
   and appear on your PBX as extension $EXT.

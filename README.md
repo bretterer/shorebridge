@@ -66,9 +66,21 @@ http://<bridge-ip>:8910
 
 Point a new phone's Config Server at the bridge; it shows up in the UI under **"New phones seen"**. Click **assign**, enter its PBX extension + auth ID + password, Save, and it goes in service, no file editing, no restart. Mappings are stored in `/etc/shorebridge/phones.json`. (The UI is LAN-only and unauthenticated for now; keep `:8910` off untrusted networks.)
 
+## Managing it
+
+The installer drops a `shorebridge` CLI:
+
+```bash
+sudo shorebridge update     # pull the latest version (pinned to newest commit) and restart
+shorebridge logs            # follow the service log
+shorebridge status          # service status
+sudo shorebridge config     # edit settings
+shorebridge ui              # print the admin UI url
+```
+
 ## Configuration
 
-`/etc/shorebridge/config.ini` (see [`config.example.ini`](config.example.ini)). Edit and `systemctl restart shorebridge`. Logs: `journalctl -u shorebridge -f`.
+`/etc/shorebridge/config.ini` (see [`config.example.ini`](config.example.ini)). Edit (`sudo shorebridge config`) and `sudo shorebridge restart`. Logs: `shorebridge logs`.
 
 ## Connectors (optional)
 

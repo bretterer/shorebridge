@@ -89,6 +89,14 @@ fi
 mkdir -p "$PREFIX/connectors.d"   # drop third-party connector .py files here
 ok "shorebridge.py + connectors"
 
+# control CLI -> /usr/local/bin/shorebridge
+if [ -f "$SCRIPT_DIR/bin/shorebridge" ]; then
+  install -m 0755 "$SCRIPT_DIR/bin/shorebridge" /usr/local/bin/shorebridge
+else
+  curl -fsSL "$RAW_BASE/bin/shorebridge" -o /usr/local/bin/shorebridge; chmod 0755 /usr/local/bin/shorebridge
+fi
+ok "shorebridge CLI (try: shorebridge update)"
+
 # ---- certificates: our own CA + a switch cert the phone will trust ----
 c "Generating certificates (CA injection trust anchor)"
 TLS="$PREFIX/tls"
@@ -168,7 +176,11 @@ cat <<EOF
   Point a phone's Config Server at $BIND_IP; it will appear there under
   "New phones seen" for one-click assignment.
 
-  Logs:    journalctl -u shorebridge -f
-  Config:  $ETC/config.ini   (edit then: systemctl restart shorebridge)
-  Phones:  $ETC/phones.json  (or manage in the web UI)
+  Manage it:
+    shorebridge update     update to the latest version + restart
+    shorebridge logs       follow the log
+    shorebridge config     edit settings
+    shorebridge ui         print the admin UI url
+
+  Config:  $ETC/config.ini      Phones:  $ETC/phones.json (or the web UI)
 EOF

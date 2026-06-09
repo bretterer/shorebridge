@@ -18,10 +18,14 @@ c()  { printf "\033[1;36m%s\033[0m\n" "$*"; }
 ok() { printf "  \033[1;32m✓\033[0m %s\n" "$*"; }
 warn(){ printf "  \033[1;33m!\033[0m %s\n" "$*"; }
 die(){ printf "\033[1;31mERROR:\033[0m %s\n" "$*" >&2; exit 1; }
-ask(){ # ask <prompt> <default> <varname>  (reads from the terminal even under curl|bash)
-  local p="$1" d="$2" __v="$3" envname="SB_$3" ans
+ask(){ # ask <prompt> <default> <varname> [secret]  (reads from the terminal even under curl|bash)
+  local p="$1" d="$2" __v="$3" secret="${4:-}" envname="SB_$3" ans
   if [ -n "${!envname:-}" ]; then printf -v "$__v" '%s' "${!envname}"; return; fi  # non-interactive override: SB_<VAR>
-  read -r -p "$p [${d}]: " ans </dev/tty || ans=""
+  if [ "$secret" = "secret" ]; then
+    read -rs -p "$p: " ans </dev/tty || ans=""; echo   # hidden input, no echo
+  else
+    read -r -p "$p [${d}]: " ans </dev/tty || ans=""
+  fi
   printf -v "$__v" '%s' "${ans:-$d}"
 }
 
@@ -69,7 +73,7 @@ ask "PBX SIP port"                      "5060"             SBC_PORT
 ask "Registrar domain (3CX: NNN.3cx.cloud; FreePBX: PBX IP)" "$SBC_IP" DOMAIN
 ask "Extension number"                  "100"              EXT
 ask "Authentication ID"                 "$EXT"             AUTHID
-ask "Authentication password"           ""                 PASSWORD
+ask "Authentication password"           ""                 PASSWORD secret
 ask "Phone timezone"                    "Eastern Standard Time" TZ
 [ -n "$PASSWORD" ] || die "password is required"
 

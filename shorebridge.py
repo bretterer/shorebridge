@@ -77,9 +77,11 @@ pstate = threading.Lock()
 def norm_mac(s):
     return re.sub(r"[^0-9a-fA-F]", "", s or "").lower()[:12]
 def mac_from_contact(contact):
-    # +sip.instance="<urn:uuid:00000000-0000-1000-8000-001049543b4c>"
-    m = re.search(r'urn:uuid:[0-9a-fA-F-]*?([0-9a-fA-F]{12})"', contact or "")
-    return norm_mac(m.group(1)) if m else None
+    # +sip.instance="<urn:uuid:00000000-0000-1000-8000-001049543b4c>" -> MAC is the last 12 hex
+    m = re.search(r'urn:uuid:([0-9a-fA-F-]+)', contact or "")
+    if not m: return None
+    hexs = re.sub(r"[^0-9a-fA-F]", "", m.group(1))
+    return hexs[-12:].lower() if len(hexs) >= 12 else None
 
 def load_phones():
     global PHONES

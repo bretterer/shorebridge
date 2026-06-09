@@ -31,6 +31,8 @@ case "$cmd" in
     if curl -fsSL "$RAW/$ref/systemd/shorebridge.service" -o "$tmp/svc" 2>/dev/null; then
       install -m 0644 "$tmp/svc" /etc/systemd/system/shorebridge.service; systemctl daemon-reload
     fi
+    # self-update the CLI too (safe: Linux lets us replace a running script)
+    curl -fsSL "$RAW/$ref/bin/shorebridge" -o "$tmp/cli" 2>/dev/null && install -m 0755 "$tmp/cli" /usr/local/bin/shorebridge || true
     systemctl restart shorebridge
     sleep 1
     if systemctl is-active --quiet shorebridge; then echo "updated to ${ref:0:12} and restarted."; else

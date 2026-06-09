@@ -44,7 +44,7 @@ case "$cmd" in
     if systemctl is-active --quiet shorebridge; then echo "now on ${ref:0:12}, restarted."; else
       echo "updated, but service not active - check: shorebridge logs" >&2; fi
     ;;
-  logs)     journalctl -u shorebridge ${2:--f} ;;
+  logs)     shift; journalctl -u shorebridge "${@:--f}" ;;
   status)   systemctl status shorebridge --no-pager || true ;;
   restart)  need_root restart; systemctl restart shorebridge; echo "restarted." ;;
   stop)     need_root stop; systemctl stop shorebridge; echo "stopped." ;;

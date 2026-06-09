@@ -43,6 +43,29 @@ case "$cmd" in
   start)    need_root start; systemctl start shorebridge; echo "started." ;;
   config)   need_root config; "${EDITOR:-nano}" "$ETC/config.ini"; echo "run 'shorebridge restart' to apply." ;;
   ui)       echo "http://$(bind_ip || echo localhost):8910" ;;
+  uninstall)
+    need_root uninstall
+    purge=false; case "${2:-}" in --purge|--full|--all) purge=true;; esac
+    systemctl stop shorebridge 2>/dev/null || true
+    systemctl disable shorebridge 2>/dev/null || true
+    rm -f /etc/systemd/system/shorebridge.service
+    systemctl daemon-reload 2>/dev/null || true
+    if $purge; then
+      rm -rf "$PREFIX" "$ETC"
+      echo "shorebridge fully removed - program, certs, config, and phones all deleted."
+      echo "NOTE: a fresh install generates a new trust CA, so any phones must be"
+      echo "      factory-reset (Mute + 25327#) to re-trust it."
+      rm -f /usr/local/bin/shorebridge
+    else
+      rm -f "$PREFIX/shorebridge.py" "$PREFIX/connectors.py"
+      rm -rf "$PREFIX/connectors.d" "$PREFIX/www/fileserver" "$PREFIX/__pycache__"
+      echo "Removed the service and program."
+      echo "Kept: $ETC (config + phones) and $PREFIX/tls + www/keystore (certs)."
+      echo "Reinstall to restore with no reconfigure (phones keep working):"
+      echo "  sudo bash -c \"\$(curl -fsSL $RAW/main/install.sh)\""
+      rm -f /usr/local/bin/shorebridge
+    fi
+    ;;
   *)
     cat <<EOF
 shorebridge - control CLI
@@ -54,6 +77,8 @@ shorebridge - control CLI
   shorebridge start|stop start / stop the service
   shorebridge config     edit /etc/shorebridge/config.ini
   shorebridge ui         print the admin UI url
+  shorebridge uninstall          remove service + program, keep config/certs (reinstall-ready)
+  shorebridge uninstall --purge  remove everything (config, certs, phones)
 EOF
     ;;
 esac

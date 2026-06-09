@@ -78,6 +78,15 @@ sudo shorebridge config     # edit settings
 shorebridge ui              # print the admin UI url
 ```
 
+### Uninstall / reinstall
+
+```bash
+sudo shorebridge uninstall          # remove service + program, KEEP config + certs
+sudo shorebridge uninstall --purge  # remove everything (config, phones, certs)
+```
+
+After a plain `uninstall`, re-running the installer restores the service **without re-prompting** (it keeps the existing `config.ini` and CA, so your phones keep working). To force fresh prompts, run the installer with `SB_RECONFIGURE=1`. After a `--purge`, a fresh install generates a new CA, so phones must be factory-reset to re-trust it.
+
 ## Configuration
 
 `/etc/shorebridge/config.ini` (see [`config.example.ini`](config.example.ini)). Edit (`sudo shorebridge config`) and `sudo shorebridge restart`. Logs: `shorebridge logs`.

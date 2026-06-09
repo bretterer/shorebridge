@@ -63,16 +63,24 @@ else
   fi
 fi
 
-# ---- gather settings ----
+# ---- gather settings (or keep an existing config) ----
 echo; c "Configuration"
-DEF_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1);exit}}')"
-[ -n "$DEF_IP" ] || DEF_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-ask "Bridge LAN IP (phones point here)" "${DEF_IP:-auto}" BIND_IP
-ask "PBX / 3CX SBC IP (same box as SBC? use this host's LAN IP)" "$BIND_IP" SBC_IP
-ask "PBX SIP port"                      "5060"             SBC_PORT
-ask "Registrar domain (3CX: NNN.3cx.cloud; FreePBX: PBX IP)" "$SBC_IP" DOMAIN
-ask "Phone timezone"                    "Eastern Standard Time" TZ
-# Per-phone extension/auth/password are assigned later in the web UI, not here.
+if [ -f "$ETC/config.ini" ] && [ -z "${SB_RECONFIGURE:-}" ]; then
+  KEEP_CONFIG=1
+  BIND_IP="$(grep -E '^\s*bind_ip' "$ETC/config.ini" | head -1 | sed 's/.*=\s*//' | tr -d '[:space:]')"
+  [ -n "$BIND_IP" ] || BIND_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  ok "keeping existing $ETC/config.ini (set SB_RECONFIGURE=1 to re-prompt)"
+else
+  KEEP_CONFIG=0
+  DEF_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1);exit}}')"
+  [ -n "$DEF_IP" ] || DEF_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  ask "Bridge LAN IP (phones point here)" "${DEF_IP:-auto}" BIND_IP
+  ask "PBX / 3CX SBC IP (same box as SBC? use this host's LAN IP)" "$BIND_IP" SBC_IP
+  ask "PBX SIP port"                      "5060"             SBC_PORT
+  ask "Registrar domain (3CX: NNN.3cx.cloud; FreePBX: PBX IP)" "$SBC_IP" DOMAIN
+  ask "Phone timezone"                    "Eastern Standard Time" TZ
+  # Per-phone extension/auth/password are assigned later in the web UI, not here.
+fi
 
 # ---- lay out files ----
 echo; c "Installing to $PREFIX"
@@ -119,7 +127,10 @@ chmod 600 "$TLS/"*.key
 ok "switch cert for $BIND_IP (signed by our CA)"
 
 # ---- config ----
-cat > "$ETC/config.ini" <<EOF
+if [ "$KEEP_CONFIG" = 1 ]; then
+  ok "config preserved (no changes)"
+else
+  cat > "$ETC/config.ini" <<EOF
 [bridge]
 bind_ip = $BIND_IP
 data_dir = $PREFIX
@@ -137,8 +148,9 @@ timezone = $TZ
 [connector]
 type = manual
 EOF
-chmod 600 "$ETC/config.ini"
-ok "wrote $ETC/config.ini"
+  chmod 600 "$ETC/config.ini"
+  ok "wrote $ETC/config.ini"
+fi
 
 # ---- port conflict check ----
 for p in 80 5061 5448 5062; do

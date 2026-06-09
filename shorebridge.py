@@ -581,10 +581,12 @@ def tls_server(port, handler):
     s.bind(("0.0.0.0", port)); s.listen(16); log(f"TLS server on :{port}")
     while True:
         c, a = s.accept()
+        if DEBUG: dbg(f"TCP connect :{port} from {a[0]}")
         try:
             tc = ctx.wrap_socket(c, server_side=True)
             threading.Thread(target=handler, args=(tc, a), daemon=True).start()
-        except ssl.SSLError:
+        except ssl.SSLError as e:
+            if DEBUG: dbg(f"TLS handshake FAILED :{port} from {a[0]}: {e}")
             try: c.close()
             except Exception: pass
 

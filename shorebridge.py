@@ -487,6 +487,8 @@ def phone_handle(conn, addr):
             msg = (head + b"\r\n\r\n" + body).decode("utf-8", "replace")
             start, hdrs, b = parse(msg); parts = start.split()
             if not parts: continue
+            if DEBUG:   # full capture of the phone->switch channel (uaCSTA dialog, bodies)
+                dbg("PHONE >>>>\n" + msg.strip() + "\n<<<< end")
             if start.startswith("SIP/2.0"):
                 with pinlock:
                     cid = H(hdrs, "call-id")

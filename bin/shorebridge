@@ -16,9 +16,14 @@ case "$cmd" in
   update)
     need_root update
     # pin to the newest commit so GitHub's raw CDN can't serve a stale copy
+    cur="$(cat "$PREFIX/.version" 2>/dev/null || true)"
     sha="$(curl -fsSL "$API/commits/main" 2>/dev/null | grep -m1 '"sha"' | cut -d'"' -f4 || true)"
     ref="${sha:-main}"
-    echo "Updating shorebridge from ${ref:0:12} ..."
+    if [ -n "$cur" ] && [ "$cur" = "$ref" ]; then
+      echo "Already on the latest version (${ref:0:12}); reapplying."
+    else
+      echo "Updating ${cur:0:12}${cur:+ -> }${ref:0:12} ..."
+    fi
     tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
     for f in shorebridge.py connectors.py; do
       curl -fsSL "$RAW/$ref/$f" -o "$tmp/$f"
@@ -33,9 +38,10 @@ case "$cmd" in
     fi
     # self-update the CLI too (safe: Linux lets us replace a running script)
     curl -fsSL "$RAW/$ref/bin/shorebridge" -o "$tmp/cli" 2>/dev/null && install -m 0755 "$tmp/cli" /usr/local/bin/shorebridge || true
+    printf '%s\n' "$ref" > "$PREFIX/.version"
     systemctl restart shorebridge
     sleep 1
-    if systemctl is-active --quiet shorebridge; then echo "updated to ${ref:0:12} and restarted."; else
+    if systemctl is-active --quiet shorebridge; then echo "now on ${ref:0:12}, restarted."; else
       echo "updated, but service not active - check: shorebridge logs" >&2; fi
     ;;
   logs)     journalctl -u shorebridge ${2:--f} ;;
@@ -45,6 +51,7 @@ case "$cmd" in
   start)    need_root start; systemctl start shorebridge; echo "started." ;;
   config)   need_root config; "${EDITOR:-nano}" "$ETC/config.ini"; echo "run 'shorebridge restart' to apply." ;;
   ui)       echo "http://$(bind_ip || echo localhost):8910" ;;
+  version)  echo "shorebridge $(cat "$PREFIX/.version" 2>/dev/null | cut -c1-12 || echo unknown)" ;;
   uninstall)
     need_root uninstall
     purge=false; case "${2:-}" in --purge|--full|--all) purge=true;; esac

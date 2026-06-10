@@ -81,6 +81,7 @@ def md5(s): return hashlib.md5(s.encode()).hexdigest()
 # SEEN:    mac -> {"ip","ts"}  phones that connected but have no mapping yet
 # REGOK:   extension -> bool   last registration result toward the PBX
 PHONES = {}; CONNS = {}; CONTACTS = {}; SEEN = {}; REGOK = {}
+PHONE_IPS = {}                       # mac -> last source IP (to map CAS clients -> extension)
 reg_threads = {}
 pstate = threading.Lock()
 
@@ -464,6 +465,7 @@ def register_phone(conn, hdrs, addr):
     ct = uri_of(H(hdrs, "contact"))
     with pstate:
         CONNS[mac] = conn
+        PHONE_IPS[mac] = addr[0]            # so CAS (a separate connection) can map IP -> extension
         if ct: CONTACTS[mac] = ct
         if mac in PHONES:
             SEEN.pop(mac, None); known = True
@@ -631,18 +633,40 @@ def cas_find_response(req):
             "message": "lookup-chunked", "cursor": "", "total-count": len(contacts) - 1,
             "contacts": contacts}
 
-def cas_dispatch(method, target, body):
-    """Return a JSON-serialisable dict for a CAS request, or None to long-poll."""
+def phone_for_ip(ip):
+    """Map a CAS client IP back to its configured extension + label (name), via the
+    MAC->IP recorded at SIP registration. Returns (extension, label) or (None, None)."""
+    for mac, mip in list(PHONE_IPS.items()):
+        if mip == ip and mac in PHONES:
+            p = PHONES[mac]; return p.get("extension", ""), p.get("label", "")
+    return None, None
+
+def cas_user_name(ext, label):
+    first, last = _split_name(label or ext)
+    return {"firstName": first, "lastName": last, "first": first, "last": last,
+            "did": ext, "extension": ext, "displayName": (label or ext),
+            "name": (label or ext)}
+
+def cas_dispatch(method, target, body, client_ip=""):
+    """Return a JSON-serialisable dict for a CAS request, or None to long-poll.
+
+    Login hands the phone a user identity (the extension mapped from its IP) so the
+    phone treats a user as logged in and asks for that user's name via
+    getExtensionProperties -- which we answer to populate the idle-screen title bar.
+    The Assign (tn+pin) flow is still left alone (it drops the line to No Service)."""
     path = urlparse(target).path
-    # NOTE: session (POST /) and login (/Login) deliberately return a minimal
-    # {"Status":"OK"} -- the known-safe behaviour that boots + registers SIP and
-    # opens the directory. The "Assign user" (tn+pin) flow is a separate, invasive
-    # CAS user-assignment that drops the line to "No service" on any mismatch, so we
-    # do NOT engage it here; the directory comes through the normal boot find query.
+    ext, label = phone_for_ip(client_ip)
     if path == "/" or path == "":                  # session manager
         return {"Status": "OK"}
-    if path.startswith("/Login"):                  # CAS login
-        return {"Status": "OK"}
+    if path.startswith("/Login"):                  # CAS login -> establish the user
+        if not ext:
+            return {"Status": "OK"}                 # unknown phone: stay anonymous (safe)
+        sid = "S" + rid(16)
+        with CAS_LOCK: CAS_SESSIONS[sid] = {"ext": ext, "label": label}
+        # home-cas MUST be a bare host (a URL here -> "Host not found"). user-id makes
+        # the phone consider a user logged in and fetch getExtensionProperties.
+        return {"SessionId": sid, "loggable-id": ext, "user-id": ext,
+                "user-role": "user", "home-cas": MYIP}
     if path.startswith("/Logout"):
         return {"Status": "OK"}
     if path.startswith("/Execute"):
@@ -652,6 +676,13 @@ def cas_dispatch(method, target, body):
         log(f"CAS Execute topic={topic} message={msg}")
         if topic == "find":
             return cas_find_response(req)
+        # the phone's own name lookup (UserConfigClr::getUserExtensionProperties)
+        blob = (body or "").lower()
+        if "extensionproperties" in blob or "firstname" in blob or topic == "get-extension-properties":
+            props = cas_user_name(ext or "", label or "")
+            log(f"CAS getExtensionProperties -> {props['displayName']}")
+            return {"request-id": req.get("request-id", 0), "topic": topic, "message": msg,
+                    "Status": "OK", **props}
         # subscribe / unsubscribe / everything else: acknowledge
         return {"request-id": req.get("request-id", 0), "topic": topic,
                 "message": msg, "Status": "OK"}
@@ -693,7 +724,7 @@ def cas_handle(conn, addr):
                 raw = "\n".join(f"{k}: {v}" for k, v in headers.items())
                 log("CAS REQUEST >>>>\n" + f"{method} {target}\n" + raw +
                     (("\n\n" + body) if body else "") + "\n<<<< end")
-            result = cas_dispatch(method, target, body)
+            result = cas_dispatch(method, target, body, client_ip=addr[0])
             if result is None:                     # GetEvents long-poll: hold, then empty
                 q = parse_qs(urlparse(target).query)
                 try: wait = min(int(q.get("timeout", ["30"])[0]), 50)

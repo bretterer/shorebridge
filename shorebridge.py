@@ -621,7 +621,11 @@ def cas_find_response(req):
         points = [PHDR]
         for i, p in enumerate(c["points"]):
             t = _CP_TYPE.get(p.get("type"), 1)
-            points.append([i, t, p["addr"], p["addr"], 0, 0])
+            # "field" is the ShoreTel contact field-type code. getCallableContactPoints
+            # only treats a point as dialable when its field is in
+            # {10,75,100,200,511,521,531,541,551}; 100 = a callable phone field.
+            # With field=0 the entry shows in the directory but won't dial.
+            points.append([i, t, p["addr"], p["addr"], 100, 0])
         contacts.append([c["id"], 1, "shorebridge", c["first"], c["last"], 0, points])
     return {"request-id": req.get("request-id", 0), "topic": "find",
             "message": "lookup-chunked", "cursor": "", "total-count": len(contacts) - 1,
@@ -711,17 +715,32 @@ def cas_handle(conn, addr):
 
 def tls_server(port, handler):
     ctx = tlsctx(); s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("0.0.0.0", port)); s.listen(16); log(f"TLS server on :{port}")
-    while True:
-        c, a = s.accept()
-        if DEBUG: dbg(f"TCP connect :{port} from {a[0]}")
+    # Retry the bind: on a quick service restart the previous process may not have
+    # released the port yet. Without this, a transient bind error would kill the
+    # thread and the port (notably CAS :5448) would silently never come up.
+    for attempt in range(10):
         try:
-            tc = ctx.wrap_socket(c, server_side=True)
-            threading.Thread(target=handler, args=(tc, a), daemon=True).start()
-        except ssl.SSLError as e:
-            if DEBUG: dbg(f"TLS handshake FAILED :{port} from {a[0]}: {e}")
-            try: c.close()
-            except Exception: pass
+            s.bind(("0.0.0.0", port)); break
+        except OSError as e:
+            log(f"TLS :{port} bind failed ({e}); retrying"); time.sleep(1)
+    else:
+        log(f"TLS :{port} could not bind after retries"); return
+    s.listen(16); log(f"TLS server on :{port}")
+    while True:
+        # Never let one bad accept/handshake kill the accept loop (and with it the
+        # listening socket) -- catch everything and keep serving.
+        try:
+            c, a = s.accept()
+            if DEBUG: dbg(f"TCP connect :{port} from {a[0]}")
+            try:
+                tc = ctx.wrap_socket(c, server_side=True)
+                threading.Thread(target=handler, args=(tc, a), daemon=True).start()
+            except ssl.SSLError as e:
+                if DEBUG: dbg(f"TLS handshake FAILED :{port} from {a[0]}: {e}")
+                try: c.close()
+                except Exception: pass
+        except Exception as e:
+            log(f"TLS :{port} accept error: {e!r}"); time.sleep(0.2)
 
 # ----------------------------- inbound: PBX -> phone -----------------------------
 def inbound_invite(xh, xraw, xaddr):

@@ -557,6 +557,7 @@ def phone_handle(conn, addr):
 CAS_LOCK = threading.Lock()
 CAS_SESSIONS = {}            # SessionId -> {"ext": str, "user": str}
 CAS_EVENTS = {}              # SessionId -> [event dict] pending for the GetEvents long-poll
+LIVE_SESSION = {}            # client-ip -> SessionId the phone is currently polling (debugger)
 DIRECTORY_JSON = os.path.join(os.path.dirname(CFG_PATH), "directory.json")
 
 def load_directory():
@@ -699,16 +700,20 @@ def cas_dispatch(method, target, body, client_ip=""):
         first, last = _split_name(label or ext or "")
         eprops = {"ext": ext, "did": ext, "firstname": first, "lastname": last,
                   "firstName": first, "lastName": last, "display-name": (label or ext),
-                  "phone-assignment": "SOFTPHONE", "phone-assignment-descr": "Softphone"}
+                  "phone-assignment": "PRIMARY-PHONE", "phone-assignment-descr": "Primary phone"}
         # the "Assign user to phone" sequence (the path that sets the title-bar name)
         if msg == "authenticate-tui-pwd":          # verify the PIN -> accept any
             log("CAS authenticate-tui-pwd -> accepted")
             return {"request-id": rid_, "result": True, "must-change": False}
         if msg == "assign-to-phone":               # assign this user to the phone
-            # Keep the response MINIMAL: a richer body makes the phone wait for a
-            # tel-completion-evt (which then aborts on our synthetic values). The minimal
-            # ack lets it proceed straight to authenticate-tui-pwd -> get-ext-props.
-            log(f"CAS assign-to-phone -> {ext} ({label}) [minimal ack, proceed]")
+            # Queue the completion event HERE (delivery on assign-to-phone provably reaches
+            # telephonyFinalResponse; after auth the pending request is cleared). response
+            # MUST be negative -> assignUserStatus(<0) success path -> sets the user/name.
+            sid = parse_qs(urlparse(target).query).get("SessionId", [""])[0]
+            evt = {"topic": "tel", "message": "tel-completion-evt",
+                   "name": "assign-to-phone", "response": -1, "error": 0}
+            with CAS_LOCK: CAS_EVENTS.setdefault(sid, []).append(evt)
+            log(f"CAS assign-to-phone -> {ext} ({label}); queued completion (response=-1)")
             return {"request-id": rid_, "topic": topic, "message": msg, "Status": "OK"}
         if msg in ("get-ext-props", "getExtensionProperties", "get-extension-properties") \
            or "extensionproperties" in (body or "").lower():
@@ -718,6 +723,8 @@ def cas_dispatch(method, target, body, client_ip=""):
         # subscribe / unsubscribe / everything else: acknowledge
         return {"request-id": rid_, "topic": topic, "message": msg, "Status": "OK"}
     if path.startswith("/GetEvents"):
+        sid = parse_qs(urlparse(target).query).get("SessionId", [""])[0]
+        if sid and client_ip: LIVE_SESSION[client_ip] = sid   # for the debugger push
         if ext and not _session_ok(target):
             return UNAUTH                          # stale session -> re-login
         return None                                # signal: long-poll
@@ -1005,13 +1012,32 @@ def write_phoneconfig():
     # and authenticatorUrl set or it logs "CAS and/or Authenticator URLs are not
     # provisioned" and the Directory key fails. All three are CasConfigDM keys; we
     # point them at our own :5448 and answer the authenticator + CAS flow there.
-    common = (f'[sip]\nsipSwitchIpList="{MYIP}"\n'
-              f'[cas]\n'
-              f'casUrl=https://{MYIP}:5448\n'
-              f'authenticatorUrl=https://{MYIP}:5448\n'
-              f'sessionManagerUrl=https://{MYIP}:5448\n')
-    open(os.path.join(d, "generated.txt"), "w").write(common)
-    open(os.path.join(d, "custom.txt"), "w").write(common + f"[user]\ntimezone={TZ}\n")
+    # sipExtension is the SipConfigDM key (confirmed at offset 0x150 in the firmware
+    # constructor) that the phone reads to know "who am I". When it is non-empty,
+    # casLoginStatus -> getExtensionProperties fetches the user's name (the title bar).
+    # Empty (anonymous) = no name. This is the real unlock for the idle-screen name.
+    def sip_block(ext=""):
+        b = f'[sip]\nsipSwitchIpList="{MYIP}"\n'
+        if ext: b += f'sipExtension={ext}\n'
+        return b
+    cas_block = (f'[cas]\n'
+                 f'casUrl=https://{MYIP}:5448\n'
+                 f'authenticatorUrl=https://{MYIP}:5448\n'
+                 f'sessionManagerUrl=https://{MYIP}:5448\n')
+    open(os.path.join(d, "generated.txt"), "w").write(sip_block() + cas_block)
+    # Embed the (single) phone's sipExtension in custom.txt (always fetched; changing
+    # its content forces the phone to re-read). Multi-phone uses per-MAC files below.
+    one_ext = ""
+    if len(PHONES) == 1:
+        one_ext = str(next(iter(PHONES.values())).get("extension", "")).strip()
+    open(os.path.join(d, "custom.txt"), "w").write(
+        sip_block(one_ext) + cas_block + f"[user]\ntimezone={TZ}\n")
+    # Per-MAC config (fetched as custom_<MAC>.txt after custom.txt) sets each phone's
+    # own sipExtension.
+    for mac, p in list(PHONES.items()):
+        ext = str(p.get("extension", "")).strip()
+        if not ext: continue
+        open(os.path.join(d, f"custom_{mac.upper()}.txt"), "w").write(sip_block(ext))
     cu = os.path.join(d, "country_US.txt")
     if not os.path.exists(cu):
         open(cu, "w").write('[site]\ndateFormatLong="\\\\a, \\\\b \\\\d \\\\Y"\n'
@@ -1155,6 +1181,25 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             out = csta_probe(mac)
             self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
             self.wfile.write((out + "\n").encode()); return
+        if path == "/debug/push":
+            # Push an arbitrary CAS event to a phone's live GetEvents long-poll, then
+            # the bridge log shows how the phone reacts. Body is raw JSON: either one
+            # event object {"topic":..} or a list. Optional ?ip= to target a phone.
+            raw = body
+            ip = (parse_qs(urlparse(self.path).query).get("ip", [""])[0]
+                  or (next(iter(LIVE_SESSION), "")))
+            sid = LIVE_SESSION.get(ip, "")
+            try: evt = json.loads(raw)
+            except Exception as e:
+                self.send_response(400); self.end_headers()
+                self.wfile.write(("bad json: %r\n" % e).encode()); return
+            events = evt if isinstance(evt, list) else [evt]
+            with CAS_LOCK:
+                if sid: CAS_EVENTS.setdefault(sid, []).extend(events)
+            log(f"DEBUG push -> ip={ip} sid={sid[:10]} {len(events)} event(s): {raw[:200]}")
+            self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
+            self.wfile.write((f"pushed {len(events)} event(s) to ip={ip} sid={sid}\n"
+                              f"(watch: shorebridge logs)\n").encode()); return
         if path == "/add":
             mac = norm_mac(f.get("mac", ""))
             pick = f.get("catalog_ext", "").strip()

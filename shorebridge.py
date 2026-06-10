@@ -542,34 +542,167 @@ def phone_handle(conn, addr):
         try: conn.close()
         except Exception: pass
 
-def cas_handle(conn, addr):
-    # CAS = ShoreTel Client Application Server (HTTPS). The phone fetches its own
-    # extension name + the directory/history here. We log requests (debug) and stub 200 OK.
+# ----------------------------- CAS: ShoreTel Client Application Server -----------------------------
+# CAS is JSON over TLS on :5448. The phone uses it for its identity (the user name
+# shown on the idle title bar after login / the "Assign" button) and the directory.
+# The flow the firmware drives (reverse-engineered from the p8_phone binary):
+#   POST /            body "expiry=N"          -> session manager: open a session
+#   POST /Login?      body {ticket,app-id,..}  -> CAS login: returns the SessionId used below
+#   POST /Execute?SessionId=..  {topic:..}     -> queries; topic "find" = directory lookup
+#   GET  /GetEvents?SessionId=..&timeout=N     -> long-poll event channel (presence/config)
+#   GET/POST /Logout?SessionId=..              -> teardown
+# We ARE the CAS server, so we accept any login and synthesize the answers.
+CAS_LOCK = threading.Lock()
+CAS_SESSIONS = {}            # SessionId -> {"ext": str, "user": str}
+DIRECTORY_JSON = os.path.join(os.path.dirname(CFG_PATH), "directory.json")
+
+def load_directory():
+    """Directory-only entries the user adds in the UI: [{"name","number","type"}].
+    These are contacts (e.g. a mobile reached by dialing 11) that are not phones."""
     try:
-        conn.settimeout(30); buf = b""
-        while b"\r\n\r\n" not in buf:
-            d = conn.recv(4096)
-            if not d: break
-            buf += d
-        if not buf: return
-        head, _, rest = buf.partition(b"\r\n\r\n")
-        htext = head.decode("utf-8", "replace")
-        cl = 0
-        for line in htext.split("\r\n"):
-            if line.lower().startswith("content-length:"):
-                try: cl = int(line.split(":", 1)[1].strip() or 0)
-                except Exception: cl = 0
-        while len(rest) < cl:
-            d = conn.recv(4096)
-            if not d: break
-            rest += d
-        reqline = htext.split("\r\n")[0]
-        log(f"CAS req: {reqline}")
-        if DEBUG:
-            body = rest[:cl].decode("utf-8", "replace")
-            log("CAS REQUEST >>>>\n" + htext + (("\n\n" + body) if body else "") + "\n<<<< end")
-        ok = b'{"Status":"OK"}'
-        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(ok), ok))
+        with open(DIRECTORY_JSON) as f:
+            d = json.load(f); return d if isinstance(d, list) else []
+    except Exception:
+        return []
+
+def save_directory(entries):
+    tmp = DIRECTORY_JSON + ".tmp"
+    with open(tmp, "w") as f: json.dump(entries, f, indent=2)
+    os.replace(tmp, DIRECTORY_JSON)
+    try: os.chmod(DIRECTORY_JSON, 0o600)
+    except Exception: pass
+
+def _split_name(s):
+    s = (s or "").strip()
+    if "," in s:                                   # "Last, First"
+        last, first = s.split(",", 1); return first.strip(), last.strip()
+    parts = s.split()
+    if len(parts) >= 2: return parts[0], " ".join(parts[1:])
+    return s, ""
+
+def cas_contacts():
+    """Assemble the directory from registered phones + directory-only entries +
+    any connector catalog. -> [{id, first, last, points:[{type,addr}]}]."""
+    out, seen = [], set()
+    for mac, p in sorted(PHONES.items()):
+        ext = str(p.get("extension", "")).strip()
+        if not ext or ext in seen: continue
+        seen.add(ext); first, last = _split_name(p.get("label") or ext)
+        out.append({"id": "ph-" + ext, "first": first, "last": last,
+                    "points": [{"type": "extension", "addr": ext}]})
+    for e in load_directory():
+        num = str(e.get("number", "")).strip()
+        if not num or num in seen: continue
+        seen.add(num); first, last = _split_name(e.get("name") or num)
+        out.append({"id": "dir-" + num, "first": first, "last": last,
+                    "points": [{"type": e.get("type", "mobile"), "addr": num}]})
+    for x in CATALOG:
+        ext = str(getattr(x, "number", "")).strip()
+        if not ext or ext in seen: continue
+        seen.add(ext); first, last = _split_name(getattr(x, "display_name", "") or ext)
+        out.append({"id": "cat-" + ext, "first": first, "last": last,
+                    "points": [{"type": "extension", "addr": ext}]})
+    return out
+
+# contact-point type -> ShoreTel numeric kind (best-effort; iterated against the phone)
+_CP_TYPE = {"extension": 1, "did": 2, "mobile": 3, "home": 4, "work": 5, "fax": 6, "external": 2}
+
+def cas_find_response(req):
+    """Build the directory result for a topic:find / lookup-chunked Execute.
+
+    The phone's contact parser (contact::fromJsonHeader + contact::fromJson, both
+    erroring "not an array") uses a COLUMNAR layout: each collection is an array
+    whose element[0] is the header (the field names in order) and elements[1..] are
+    positional rows. Contact-points nest the same way inside each contact row."""
+    CHDR = ["id", "source-type", "source-name", "first", "last", "rec-type", "contact-points"]
+    PHDR = ["id", "type", "addr", "addr-canonical", "field", "features"]
+    contacts = [CHDR]
+    for c in cas_contacts():
+        points = [PHDR]
+        for i, p in enumerate(c["points"]):
+            t = _CP_TYPE.get(p.get("type"), 1)
+            points.append([i, t, p["addr"], p["addr"], 0, 0])
+        contacts.append([c["id"], 1, "shorebridge", c["first"], c["last"], 0, points])
+    return {"request-id": req.get("request-id", 0), "topic": "find",
+            "message": "lookup-chunked", "cursor": "", "total-count": len(contacts) - 1,
+            "contacts": contacts}
+
+def cas_dispatch(method, target, body):
+    """Return a JSON-serialisable dict for a CAS request, or None to long-poll."""
+    path = urlparse(target).path
+    # NOTE: session (POST /) and login (/Login) deliberately return a minimal
+    # {"Status":"OK"} -- the known-safe behaviour that boots + registers SIP and
+    # opens the directory. The "Assign user" (tn+pin) flow is a separate, invasive
+    # CAS user-assignment that drops the line to "No service" on any mismatch, so we
+    # do NOT engage it here; the directory comes through the normal boot find query.
+    if path == "/" or path == "":                  # session manager
+        return {"Status": "OK"}
+    if path.startswith("/Login"):                  # CAS login
+        return {"Status": "OK"}
+    if path.startswith("/Logout"):
+        return {"Status": "OK"}
+    if path.startswith("/Execute"):
+        try: req = json.loads(body or "{}")
+        except Exception: req = {}
+        topic, msg = req.get("topic"), req.get("message")
+        log(f"CAS Execute topic={topic} message={msg}")
+        if topic == "find":
+            return cas_find_response(req)
+        # subscribe / unsubscribe / everything else: acknowledge
+        return {"request-id": req.get("request-id", 0), "topic": topic,
+                "message": msg, "Status": "OK"}
+    if path.startswith("/GetEvents"):
+        return None                                # signal: long-poll
+    return {"Status": "OK"}
+
+def _read_http(conn, buf):
+    """Read one HTTP request off a (keep-alive) connection. Returns
+    (method, target, headers, body, leftover_buf) or None at EOF."""
+    while b"\r\n\r\n" not in buf:
+        d = conn.recv(4096)
+        if not d: return None
+        buf += d
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    lines = head.decode("utf-8", "replace").split("\r\n")
+    try: method, target, _ = lines[0].split(" ", 2)
+    except ValueError: return None
+    headers = {}
+    for ln in lines[1:]:
+        if ":" in ln: k, v = ln.split(":", 1); headers[k.strip().lower()] = v.strip()
+    cl = int(headers.get("content-length", "0") or 0)
+    while len(rest) < cl:
+        d = conn.recv(4096)
+        if not d: break
+        rest += d
+    body = rest[:cl].decode("utf-8", "replace"); leftover = rest[cl:]
+    return method, target, headers, body, leftover
+
+def cas_handle(conn, addr):
+    try:
+        conn.settimeout(310); buf = b""
+        while True:
+            got = _read_http(conn, buf)
+            if not got: break
+            method, target, headers, body, buf = got
+            log(f"CAS req: {method} {target}")
+            if DEBUG:
+                raw = "\n".join(f"{k}: {v}" for k, v in headers.items())
+                log("CAS REQUEST >>>>\n" + f"{method} {target}\n" + raw +
+                    (("\n\n" + body) if body else "") + "\n<<<< end")
+            result = cas_dispatch(method, target, body)
+            if result is None:                     # GetEvents long-poll: hold, then empty
+                q = parse_qs(urlparse(target).query)
+                try: wait = min(int(q.get("timeout", ["30"])[0]), 50)
+                except Exception: wait = 30
+                time.sleep(max(1, wait))
+                result = {"events": []}
+            payload = json.dumps(result).encode()
+            keep = "keep-alive" in headers.get("connection", "").lower()
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: %d\r\nConnection: %s\r\n\r\n%s"
+                % (len(payload), b"keep-alive" if keep else b"close", payload))
+            if not keep: break
     except Exception as e:
         if DEBUG: log("CAS err " + repr(e))
     finally:
@@ -768,7 +901,15 @@ class QuietHTTP(http.server.SimpleHTTPRequestHandler):
 
 def write_phoneconfig():
     d = os.path.join(HTTP_ROOT, "fileserver", "phoneconfig"); os.makedirs(d, exist_ok=True)
-    common = f'[sip]\nsipSwitchIpList="{MYIP}"\n[cas]\ncasUrl=https://{MYIP}:5448\n'
+    # CAS (Client Application Server) provisioning. The phone needs BOTH casUrl
+    # and authenticatorUrl set or it logs "CAS and/or Authenticator URLs are not
+    # provisioned" and the Directory key fails. All three are CasConfigDM keys; we
+    # point them at our own :5448 and answer the authenticator + CAS flow there.
+    common = (f'[sip]\nsipSwitchIpList="{MYIP}"\n'
+              f'[cas]\n'
+              f'casUrl=https://{MYIP}:5448\n'
+              f'authenticatorUrl=https://{MYIP}:5448\n'
+              f'sessionManagerUrl=https://{MYIP}:5448\n')
     open(os.path.join(d, "generated.txt"), "w").write(common)
     open(os.path.join(d, "custom.txt"), "w").write(common + f"[user]\ntimezone={TZ}\n")
     cu = os.path.join(d, "country_US.txt")
@@ -817,7 +958,23 @@ small{{color:#888}}
 </table>
 <p><button type=submit>Save phone</button></p>
 </form>
-<p><small>Edits apply immediately. Config: {cfg}</small></p>
+
+<h2>Directory contacts <small>(name + number only, no phone)</small></h2>
+<table><tr><th>Name</th><th>Number</th><th>Type</th><th></th></tr>
+{directory}
+</table>
+<form method=post action=/dir-add class=card>
+<table>
+<tr><td>Name</td><td><input name=name placeholder="Cell - Brian" required></td></tr>
+<tr><td>Number</td><td><input name=number placeholder="11" required></td></tr>
+<tr><td>Type</td><td><select name=type>
+<option value=mobile>mobile</option><option value=extension>extension</option>
+<option value=home>home</option><option value=work>work</option><option value=external>external</option>
+</select></td></tr>
+</table>
+<p><button type=submit>Add contact</button></p>
+</form>
+<p><small>Shown in every phone's Directory alongside registered phones. Edits apply immediately. Config: {cfg}</small></p>
 <script>
 // auto-refresh to surface newly-seen phones, but never while you're typing in a field
 setInterval(function(){{
@@ -848,6 +1005,14 @@ def render():
                         f"<form method=get style='display:inline'><input type=hidden name=add value='{m}'>"
                         f"<button>assign &raquo;</button></form></li>" for m, v in sorted(seen.items()))
         disc = f"<h2>New phones seen (unconfigured)</h2><div class=card><ul>{items}</ul></div>"
+    dirrows = []
+    for i, e in enumerate(load_directory()):
+        dirrows.append(
+            f"<tr><td>{e.get('name','')}</td><td>{e.get('number','')}</td><td>{e.get('type','')}</td>"
+            f"<td><form method=post action=/dir-delete style=margin:0>"
+            f"<input type=hidden name=number value='{e.get('number','')}'>"
+            f"<button class=d>remove</button></form></td></tr>")
+    dirhtml = "".join(dirrows) or "<tr><td colspan=4><small>none yet</small></td></tr>"
     with catalog_lock: cat = list(CATALOG)
     if cat:
         opts = "".join(f"<option value='{e.number}'>{e.number} &mdash; {e.display_name}</option>" for e in cat)
@@ -860,15 +1025,15 @@ def render():
         connstatus = (f"Connector: {CONN_TYPE} (no catalog &mdash; enter credentials manually)"
                       if CONN_TYPE == "manual" else
                       f"Connector: {CONN_TYPE} &mdash; no extensions returned (check [connector] config)")
-    return rowhtml, disc, catalog, connstatus
+    return rowhtml, disc, catalog, connstatus, dirhtml
 
 class AdminHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         if DEBUG: super().log_message(*a)
     def _page(self, addmac=""):
-        rowhtml, disc, catalog, connstatus = render()
+        rowhtml, disc, catalog, connstatus, dirhtml = render()
         html = PAGE.format(ip=MYIP, rows=rowhtml, discovered=disc, addmac=addmac,
-                           cfg=PHONES_JSON, catalog=catalog, connstatus=connstatus)
+                           cfg=PHONES_JSON, catalog=catalog, connstatus=connstatus, directory=dirhtml)
         self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
         self.wfile.write(html.encode())
     def do_GET(self):
@@ -912,6 +1077,17 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             mac = norm_mac(f.get("mac", ""))
             with pstate: PHONES.pop(mac, None)
             save_phones(); log(f"UI: removed phone {mac}")
+        elif path == "/dir-add":
+            name = f.get("name", "").strip(); number = f.get("number", "").strip()
+            typ = f.get("type", "mobile").strip() or "mobile"
+            if name and number:
+                entries = [e for e in load_directory() if str(e.get("number")) != number]
+                entries.append({"name": name, "number": number, "type": typ})
+                save_directory(entries); log(f"UI: added directory contact {name} ({number})")
+        elif path == "/dir-delete":
+            number = f.get("number", "").strip()
+            save_directory([e for e in load_directory() if str(e.get("number")) != number])
+            log(f"UI: removed directory contact {number}")
         self.send_response(303); self.send_header("Location", "/"); self.end_headers()
 
 def admin_server():

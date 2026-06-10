@@ -703,8 +703,10 @@ def cas_dispatch(method, target, body, client_ip=""):
                   "phone-assignment": "PRIMARY-PHONE", "phone-assignment-descr": "Primary phone"}
         # the "Assign user to phone" sequence (the path that sets the title-bar name)
         if msg == "authenticate-tui-pwd":          # verify the PIN -> accept any
-            log("CAS authenticate-tui-pwd -> accepted")
-            return {"request-id": rid_, "result": True, "must-change": False}
+            # The phone reads "response" (int, AsInt; 0 = ok) and "must-change" (bool),
+            # NOT "result". Wrong key = it never sees the auth succeed and stalls.
+            log("CAS authenticate-tui-pwd -> accepted (response=0)")
+            return {"request-id": rid_, "response": 0, "must-change": False}
         if msg == "assign-to-phone":               # assign this user to the phone
             # Queue the completion event HERE (delivery on assign-to-phone provably reaches
             # telephonyFinalResponse; after auth the pending request is cleared). response
@@ -1027,17 +1029,28 @@ def write_phoneconfig():
     open(os.path.join(d, "generated.txt"), "w").write(sip_block() + cas_block)
     # Embed the (single) phone's sipExtension in custom.txt (always fetched; changing
     # its content forces the phone to re-read). Multi-phone uses per-MAC files below.
-    one_ext = ""
+    # The idle-screen name is two plain pphone.conf [user] keys, userFirstName and
+    # userLastName (confirmed on-device with a root shell). Serve them per phone,
+    # split from the label, so every phone shows its name with no CAS user-assignment.
+    def user_block(label, ext, with_tz=False):
+        first, last = _split_name(label or ext or "")
+        b = "[user]\n"
+        if with_tz: b += f"timezone={TZ}\n"
+        return b + f"userFirstName={first}\nuserLastName={last}\n"
+    one_ext = one_label = ""
     if len(PHONES) == 1:
-        one_ext = str(next(iter(PHONES.values())).get("extension", "")).strip()
+        _one = next(iter(PHONES.values()))
+        one_ext = str(_one.get("extension", "")).strip()
+        one_label = _one.get("label", "")
     open(os.path.join(d, "custom.txt"), "w").write(
-        sip_block(one_ext) + cas_block + f"[user]\ntimezone={TZ}\n")
+        sip_block(one_ext) + cas_block + user_block(one_label, one_ext, with_tz=True))
     # Per-MAC config (fetched as custom_<MAC>.txt after custom.txt) sets each phone's
-    # own sipExtension.
+    # own sipExtension and display name.
     for mac, p in list(PHONES.items()):
         ext = str(p.get("extension", "")).strip()
         if not ext: continue
-        open(os.path.join(d, f"custom_{mac.upper()}.txt"), "w").write(sip_block(ext))
+        open(os.path.join(d, f"custom_{mac.upper()}.txt"), "w").write(
+            sip_block(ext) + user_block(p.get("label", ""), ext))
     cu = os.path.join(d, "country_US.txt")
     if not os.path.exists(cu):
         open(cu, "w").write('[site]\ndateFormatLong="\\\\a, \\\\b \\\\d \\\\Y"\n'

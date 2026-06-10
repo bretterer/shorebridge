@@ -556,6 +556,7 @@ def phone_handle(conn, addr):
 # We ARE the CAS server, so we accept any login and synthesize the answers.
 CAS_LOCK = threading.Lock()
 CAS_SESSIONS = {}            # SessionId -> {"ext": str, "user": str}
+CAS_EVENTS = {}              # SessionId -> [event dict] pending for the GetEvents long-poll
 DIRECTORY_JSON = os.path.join(os.path.dirname(CFG_PATH), "directory.json")
 
 def load_directory():
@@ -647,6 +648,13 @@ def cas_user_name(ext, label):
             "did": ext, "extension": ext, "displayName": (label or ext),
             "name": (label or ext)}
 
+UNAUTH = object()   # sentinel: make cas_handle answer HTTP 401 (forces the phone to re-login)
+
+def _session_ok(target):
+    sid = parse_qs(urlparse(target).query).get("SessionId", [""])[0]
+    with CAS_LOCK:
+        return bool(sid) and sid in CAS_SESSIONS
+
 def cas_dispatch(method, target, body, client_ip=""):
     """Return a JSON-serialisable dict for a CAS request, or None to long-poll.
 
@@ -656,37 +664,62 @@ def cas_dispatch(method, target, body, client_ip=""):
     The Assign (tn+pin) flow is still left alone (it drops the line to No Service)."""
     path = urlparse(target).path
     ext, label = phone_for_ip(client_ip)
-    if path == "/" or path == "":                  # session manager
-        return {"Status": "OK"}
+    if path == "/" or path == "":                  # session manager: authenticate the user
+        if not ext:
+            return {"Status": "OK"}                 # unknown phone: anonymous (safe)
+        sid = "S" + rid(16)
+        with CAS_LOCK: CAS_SESSIONS[sid] = {"ext": ext, "label": label}
+        # Establish the current user here (this is what the title bar's user config
+        # reads). logon-server-ip is a BARE host. session-id + user-id set the user.
+        return {"session-id": sid, "user-id": ext, "logon-server-ip": MYIP}
     if path.startswith("/Login"):                  # CAS login -> establish the user
         if not ext:
             return {"Status": "OK"}                 # unknown phone: stay anonymous (safe)
         sid = "S" + rid(16)
         with CAS_LOCK: CAS_SESSIONS[sid] = {"ext": ext, "label": label}
-        # home-cas MUST be a bare host (a URL here -> "Host not found"). user-id makes
-        # the phone consider a user logged in and fetch getExtensionProperties.
-        return {"SessionId": sid, "loggable-id": ext, "user-id": ext,
-                "user-role": "user", "home-cas": MYIP}
+        # Do NOT return home-cas: the firmware treats it as "home CAS server changed"
+        # and re-bootstraps -> POST / -> Login -> sees it again -> infinite login loop.
+        # Omitting it keeps the phone on us. user-id is what makes it fetch its name.
+        return {"SessionId": sid, "loggable-id": ext, "user-id": ext, "user-role": "user"}
     if path.startswith("/Logout"):
         return {"Status": "OK"}
     if path.startswith("/Execute"):
+        # Force re-login if the session is stale/empty (e.g. after a bridge restart,
+        # or the phone's cached anonymous session): 401 -> phone runs Login again and
+        # picks up its identity. Only for phones we can identify (ext known).
+        if ext and not _session_ok(target):
+            return UNAUTH
         try: req = json.loads(body or "{}")
         except Exception: req = {}
         topic, msg = req.get("topic"), req.get("message")
+        rid_ = req.get("request-id", 0)
         log(f"CAS Execute topic={topic} message={msg}")
         if topic == "find":
             return cas_find_response(req)
-        # the phone's own name lookup (UserConfigClr::getUserExtensionProperties)
-        blob = (body or "").lower()
-        if "extensionproperties" in blob or "firstname" in blob or topic == "get-extension-properties":
-            props = cas_user_name(ext or "", label or "")
-            log(f"CAS getExtensionProperties -> {props['displayName']}")
-            return {"request-id": req.get("request-id", 0), "topic": topic, "message": msg,
-                    "Status": "OK", **props}
+        first, last = _split_name(label or ext or "")
+        eprops = {"ext": ext, "did": ext, "firstname": first, "lastname": last,
+                  "firstName": first, "lastName": last, "display-name": (label or ext),
+                  "phone-assignment": "SOFTPHONE", "phone-assignment-descr": "Softphone"}
+        # the "Assign user to phone" sequence (the path that sets the title-bar name)
+        if msg == "authenticate-tui-pwd":          # verify the PIN -> accept any
+            log("CAS authenticate-tui-pwd -> accepted")
+            return {"request-id": rid_, "result": True, "must-change": False}
+        if msg == "assign-to-phone":               # assign this user to the phone
+            # Keep the response MINIMAL: a richer body makes the phone wait for a
+            # tel-completion-evt (which then aborts on our synthetic values). The minimal
+            # ack lets it proceed straight to authenticate-tui-pwd -> get-ext-props.
+            log(f"CAS assign-to-phone -> {ext} ({label}) [minimal ack, proceed]")
+            return {"request-id": rid_, "topic": topic, "message": msg, "Status": "OK"}
+        if msg in ("get-ext-props", "getExtensionProperties", "get-extension-properties") \
+           or "extensionproperties" in (body or "").lower():
+            log(f"CAS get-ext-props -> {label or ext}")
+            return {"request-id": rid_, "topic": topic, "message": msg,
+                    "result": True, "ext-props": eprops, **eprops}
         # subscribe / unsubscribe / everything else: acknowledge
-        return {"request-id": req.get("request-id", 0), "topic": topic,
-                "message": msg, "Status": "OK"}
+        return {"request-id": rid_, "topic": topic, "message": msg, "Status": "OK"}
     if path.startswith("/GetEvents"):
+        if ext and not _session_ok(target):
+            return UNAUTH                          # stale session -> re-login
         return None                                # signal: long-poll
     return {"Status": "OK"}
 
@@ -725,12 +758,29 @@ def cas_handle(conn, addr):
                 log("CAS REQUEST >>>>\n" + f"{method} {target}\n" + raw +
                     (("\n\n" + body) if body else "") + "\n<<<< end")
             result = cas_dispatch(method, target, body, client_ip=addr[0])
-            if result is None:                     # GetEvents long-poll: hold, then empty
+            if result is UNAUTH:                    # stale session -> 401 forces a re-login
+                b401 = b'{"error":401,"message":"session invalid"}'
+                conn.sendall(b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n"
+                             b"Content-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(b401), b401))
+                break
+            if result is None:                     # GetEvents long-poll
                 q = parse_qs(urlparse(target).query)
+                sid = q.get("SessionId", [""])[0]
                 try: wait = min(int(q.get("timeout", ["30"])[0]), 50)
                 except Exception: wait = 30
-                time.sleep(max(1, wait))
-                result = {"events": []}
+                ev = []
+                for _ in range(max(1, int(wait / 0.25))):   # wake early when an event is queued
+                    with CAS_LOCK: ev = CAS_EVENTS.pop(sid, [])
+                    if ev: break
+                    time.sleep(0.25)
+                # The phone's event parser expects a bare event object with "topic" at
+                # top level (it discards a wrapper like {"events":[...]}). Deliver the
+                # event object directly; an empty poll keeps the known-safe shape.
+                if ev:
+                    log(f"CAS GetEvents -> delivering {len(ev)} event(s)")
+                    result = ev                    # bare array of event objects
+                else:
+                    result = {"events": []}
             payload = json.dumps(result).encode()
             keep = "keep-alive" in headers.get("connection", "").lower()
             conn.sendall(

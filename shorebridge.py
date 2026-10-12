@@ -278,6 +278,19 @@ def sdp_media(sdp):
         if line.startswith("m=audio") and port is None: port = int(line.split()[1])
     return (ip, port) if ip and port else None
 
+def sdp_telephone_event(sdp):
+    for line in (sdp or "").split("\n"):
+        m = re.match(r"a=rtpmap:(\d+)\s+telephone-event/", line.strip(), re.I)
+        if m: return int(m.group(1))
+    return None
+
+def translate_rtp_payload(data, source_pt, target_pt):
+    if source_pt is None or target_pt is None or source_pt == target_pt or len(data) < 2:
+        return data
+    if (data[1] & 0x7f) != source_pt:
+        return data
+    return data[:1] + bytes([(data[1] & 0x80) | target_pt]) + data[2:]
+
 class CallSession:
     def __init__(s, dst, conn, mac, ext, authid, password):
         s.dst = dst; s.pc = conn; s.mac = mac
@@ -286,6 +299,7 @@ class CallSession:
         s.p_callid = None; s.ph = None
         s.sockP, s.rpP = alloc_rtp(); s.sock3, s.rp3 = alloc_rtp()
         s.phone_rtp = None; s.x_rtp = None
+        s.phone_dtmf_pt = None; s.x_dtmf_pt = None
         s.alive = True; s.p_ftag = None; s.p_totag = None; s.p_addr = None
         s.p_dialog = None; s.x_dialog = None; s.p_inv = None
     def on_3cx_response(s, msg): pass
@@ -305,11 +319,13 @@ class CallSession:
                 if so is s.sockP:
                     s.phone_rtp = a; np_ += 1
                     if s.x_rtp:
+                        d = translate_rtp_payload(d, s.phone_dtmf_pt, s.x_dtmf_pt)
                         try: s.sock3.sendto(d, s.x_rtp)
                         except Exception: pass
                 else:
                     s.x_rtp = a; n3 += 1
                     if s.phone_rtp:
+                        d = translate_rtp_payload(d, s.x_dtmf_pt, s.phone_dtmf_pt)
                         try: s.sockP.sendto(d, s.phone_rtp)
                         except Exception: pass
                 if np_ in (1, 250) or n3 in (1, 250): dbg(f"relay: phone->{np_} pbx->{n3}")
@@ -439,6 +455,7 @@ def phone_invite(conn, mac, hdrs, body, addr):
     log(f"phone {mac} (ext {ext}) dialed {dst}")
     cs = CallSession(dst, conn, mac, ext, authid, password)
     cs.p_callid = H(hdrs, "call-id"); cs.ph = hdrs; cs.p_addr = addr; cs.phone_rtp = sdp_media(body)
+    cs.phone_dtmf_pt = sdp_telephone_event(body)
     CALLS[cs.p_callid] = cs; CALLS[cs.x_callid] = cs
     conn.sendall(p_resp(100, "Trying", hdrs, addr, "INVITE"))
     r = x_invite(cs)
@@ -448,7 +465,7 @@ def phone_invite(conn, mac, hdrs, body, addr):
     if code >= 300:
         log(f"PBX rejected: {r.splitlines()[0]}")
         conn.sendall(p_resp(code if code < 700 else 486, "Declined", hdrs, addr, "INVITE")); cs.teardown(); return
-    _, xh, xb = parse(r); cs.x_rtp = sdp_media(xb); cs.x_totag = H(xh, "to"); x_ack_ok(r, cs)
+    _, xh, xb = parse(r); cs.x_rtp = sdp_media(xb); cs.x_dtmf_pt = sdp_telephone_event(xb); cs.x_totag = H(xh, "to"); x_ack_ok(r, cs)
     cs.x_dialog = {'ruri': uri_of(H(xh, "contact")) or f"sip:{dst}@{DOMAIN}", 'transport': 'UDP', 'lport': P3CX,
                    'local': f"<sip:{ext}@{DOMAIN}>", 'ltag': cs.x_ftag, 'remote': H(xh, "to"),
                    'callid': cs.x_callid, 'route': list(reversed(xh.get("record-route", []))), 'cseq': 2}
@@ -898,7 +915,7 @@ def inbound_invite(xh, xraw, xaddr):
     code = int(final.split("\r\n")[0].split()[1])
     if code >= 300:
         u3.sendto(resp_line(486, "Busy Here", xh).encode(), xaddr); cs.teardown(); return
-    _, ph, pb = parse(final); cs.phone_rtp = sdp_media(pb); cs.p_totag = H(ph, "to")
+    _, ph, pb = parse(final); cs.phone_rtp = sdp_media(pb); cs.phone_dtmf_pt = sdp_telephone_event(pb); cs.p_totag = H(ph, "to")
     ack = ("\r\n".join([
         f"ACK {phone_uri} SIP/2.0", f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)}",
         "Max-Forwards: 70", f"From: <sips:{caller}@{MYIP}>;tag={cs.p_ftag}", f"To: {cs.p_totag}",

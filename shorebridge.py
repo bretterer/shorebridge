@@ -445,26 +445,46 @@ def p_resp(code, reason, hdrs, addr, method, sdp=None):
         return ("\r\n".join(L) + "\r\n\r\n").encode() + b
     L.append("Content-Length: 0"); return ("\r\n".join(L) + "\r\n\r\n").encode()
 
+def phone_send(conn, data):
+    """Send on a phone dialog, tolerating a peer that closed the TLS socket."""
+    try:
+        conn.sendall(data)
+        return True
+    except (OSError, ssl.SSLError) as e:
+        dbg(f"phone socket closed while sending: {e!r}")
+        return False
+
+def phone_invite_worker(conn, mac, hdrs, body, addr):
+    try:
+        phone_invite(conn, mac, hdrs, body, addr)
+    except Exception as e:
+        log(f"phone INVITE worker error: {e!r}")
+        cs = CALLS.get(H(hdrs, "call-id"))
+        if cs:
+            try: cs.teardown()
+            except Exception as cleanup_error: log(f"phone INVITE cleanup error: {cleanup_error!r}")
+
 def phone_invite(conn, mac, hdrs, body, addr):
     to = H(hdrs, "to"); m = re.search(r'sips?:([^@>]+)@', to); dst = m.group(1) if m else "0"
     creds = creds_for_mac(mac)
     if not creds:
         log(f"unconfigured phone {mac} tried to dial {dst}")
-        conn.sendall(p_resp(403, "Forbidden", hdrs, addr, "INVITE")); return
+        phone_send(conn, p_resp(403, "Forbidden", hdrs, addr, "INVITE")); return
     ext, authid, password = creds
     log(f"phone {mac} (ext {ext}) dialed {dst}")
     cs = CallSession(dst, conn, mac, ext, authid, password)
     cs.p_callid = H(hdrs, "call-id"); cs.ph = hdrs; cs.p_addr = addr; cs.phone_rtp = sdp_media(body)
     cs.phone_dtmf_pt = sdp_telephone_event(body)
     CALLS[cs.p_callid] = cs; CALLS[cs.x_callid] = cs
-    conn.sendall(p_resp(100, "Trying", hdrs, addr, "INVITE"))
+    if not phone_send(conn, p_resp(100, "Trying", hdrs, addr, "INVITE")):
+        cs.teardown(); return
     r = x_invite(cs)
     if not r:
-        log("PBX no answer"); conn.sendall(p_resp(504, "Server Timeout", hdrs, addr, "INVITE")); cs.teardown(); return
+        log("PBX no answer"); phone_send(conn, p_resp(504, "Server Timeout", hdrs, addr, "INVITE")); cs.teardown(); return
     code = int(r.split("\r\n")[0].split()[1])
     if code >= 300:
         log(f"PBX rejected: {r.splitlines()[0]}")
-        conn.sendall(p_resp(code if code < 700 else 486, "Declined", hdrs, addr, "INVITE")); cs.teardown(); return
+        phone_send(conn, p_resp(code if code < 700 else 486, "Declined", hdrs, addr, "INVITE")); cs.teardown(); return
     _, xh, xb = parse(r); cs.x_rtp = sdp_media(xb); cs.x_dtmf_pt = sdp_telephone_event(xb); cs.x_totag = H(xh, "to"); x_ack_ok(r, cs)
     cs.x_dialog = {'ruri': uri_of(H(xh, "contact")) or f"sip:{dst}@{DOMAIN}", 'transport': 'UDP', 'lport': P3CX,
                    'local': f"<sip:{ext}@{DOMAIN}>", 'ltag': cs.x_ftag, 'remote': H(xh, "to"),
@@ -476,7 +496,8 @@ def phone_invite(conn, mac, hdrs, body, addr):
     ans = ("v=0\r\n" f"o=switch 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
            f"m=audio {cs.rpP} RTP/AVP 0 102\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:102 telephone-event/8000\r\n" "a=ptime:20\r\n" "a=sendrecv\r\n"
            "m=audio 0 RTP/SAVP 0\r\n")
-    conn.sendall(p_resp(200, "OK", hdrs, addr, "INVITE", sdp=ans))
+    if not phone_send(conn, p_resp(200, "OK", hdrs, addr, "INVITE", sdp=ans)):
+        cs.teardown(); return
     log(f"call up: ext {ext} <-> {dst}")
 
 def register_phone(conn, hdrs, addr):
@@ -553,7 +574,7 @@ def phone_handle(conn, addr):
                 mymac = register_phone(conn, hdrs, addr)
                 conn.sendall(p_resp(200, "OK", hdrs, addr, method))
             elif method == "INVITE":
-                threading.Thread(target=phone_invite, args=(conn, mymac, hdrs, b, addr), daemon=True).start()
+                threading.Thread(target=phone_invite_worker, args=(conn, mymac, hdrs, b, addr), daemon=True).start()
             elif method == "BYE":
                 cs = CALLS.get(H(hdrs, "call-id"))
                 conn.sendall(p_resp(200, "OK", hdrs, addr, method))

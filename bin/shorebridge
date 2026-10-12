@@ -2,7 +2,7 @@
 # shorebridge control CLI. Installed to /usr/local/bin/shorebridge.
 set -euo pipefail
 
-REPO="bretterer/shorebridge"
+REPO="tpglitch/shorebridge"
 PREFIX="/opt/shorebridge"
 ETC="/etc/shorebridge"
 RAW="https://raw.githubusercontent.com/$REPO"

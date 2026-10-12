@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-shorebridge - use ShoreTel/Mitel IP400-series phones (IP480/480g/485g) with any
-standard SIP PBX (3CX, FreePBX/Asterisk, FreeSWITCH, ...).
+tpglitch Shorebridge - use ShoreTel/Mitel IP400-series phones (IP480/480g/485g)
+with any standard SIP PBX (3CX, FreePBX/Asterisk, FreeSWITCH, ...).
 
 These phones, on the Mitel/RingCentral "generic SIP" firmware, speak SIP only over
 TLS and pin the server certificate to a CA they download from their config server.

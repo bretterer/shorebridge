@@ -261,7 +261,7 @@ def resp_line(code, reason, hdrs):
 
 # ----------------------------- RTP relay -----------------------------
 def alloc_rtp():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     for p in range(12000, 12800, 2):
         try: s.bind((MYIP, p)); return s, p
         except OSError: continue

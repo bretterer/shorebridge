@@ -1103,7 +1103,7 @@ button.d{{background:#ddd;color:#333}}
 .err{{background:#fef2f2;border:1px solid #fca5a5;color:#991b1b;border-radius:8px;padding:.6rem 1rem;margin:.6rem 0}}
 small{{color:#888}}
 </style></head><body>
-<h1>shorebridge <small>{ip}</small> <a href=/ style="font-size:.8rem;font-weight:400">&#8635; refresh</a></h1>
+<h1>tpglitch Shorebridge <small>{ip}</small> <a href=/ style="font-size:.8rem;font-weight:400">&#8635; refresh</a></h1>
 <p><small>{connstatus}</small></p>
 {err}
 <h2>Configured phones</h2>

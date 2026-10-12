@@ -1090,7 +1090,7 @@ def http_server():
     httpd.serve_forever()
 
 # ----------------------------- admin web UI (port UI_PORT) -----------------------------
-PAGE = """<!doctype html><html><head><meta charset=utf-8><title>shorebridge</title>
+PAGE = """<!doctype html><html><head><meta charset=utf-8><title>tpglitch Shorebridge</title>
 <style>
 body{{font:15px system-ui,sans-serif;margin:2rem;max-width:820px;color:#222}}
 h1{{font-size:1.4rem}} h2{{font-size:1.05rem;margin-top:1.8rem;color:#444}}

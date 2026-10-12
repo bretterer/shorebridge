@@ -528,7 +528,10 @@ def phone_handle(conn, addr):
             while buf[:2] == b"\r\n": buf = buf[2:]
             if b"\r\n\r\n" not in buf:
                 try: d = conn.recv(4096)
-                except socket.timeout: continue
+                except socket.timeout:
+                    # A phone that disappears without closing TCP must not remain
+                    # in CONNS forever; the finally block below removes it.
+                    return
                 if not d: return
                 if d.strip(b"\r\n") == b"" and buf == b"": conn.sendall(b"\r\n"); continue
                 buf += d; continue

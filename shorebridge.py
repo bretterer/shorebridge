@@ -20,7 +20,8 @@ Single process, Python standard library only.
 """
 import socket, ssl, threading, hashlib, random, time, re, os, sys, json, configparser
 import http.server, socketserver, functools
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, quote
+from html import escape as html_escape
 import connectors
 
 # ----------------------------- config -----------------------------
@@ -261,6 +262,8 @@ def resp_line(code, reason, hdrs):
 
 # ----------------------------- RTP relay -----------------------------
 def alloc_rtp():
+    # Do not set SO_REUSEADDR here. On Linux it lets two UDP sockets share one
+    # port, which made the phone leg and the PBX leg of a call collide.
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     for p in range(12000, 12800, 2):
         try: s.bind((MYIP, p)); return s, p
@@ -465,6 +468,11 @@ def register_phone(conn, hdrs, addr):
     ct = uri_of(H(hdrs, "contact"))
     with pstate:
         CONNS[mac] = conn
+        # Drop stale entries for other phones that used this IP before (DHCP churn),
+        # otherwise the CAS lookup by IP can return the wrong phone's identity.
+        for other, oip in list(PHONE_IPS.items()):
+            if oip == addr[0] and other != mac:
+                PHONE_IPS.pop(other, None)
         PHONE_IPS[mac] = addr[0]            # so CAS (a separate connection) can map IP -> extension
         if ct: CONTACTS[mac] = ct
         if mac in PHONES:
@@ -1008,7 +1016,21 @@ class QuietHTTP(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a):
         if DEBUG: super().log_message(*a)
 
+PHONECONFIG_LOCK = threading.Lock()
+
+def _write_atomic(path, text):
+    # Write to a temp file and rename it, so a phone never fetches a half written file.
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
 def write_phoneconfig():
+    # Safe to call from any thread. Called at startup and on every phone change.
+    with PHONECONFIG_LOCK:
+        _write_phoneconfig()
+
+def _write_phoneconfig():
     d = os.path.join(HTTP_ROOT, "fileserver", "phoneconfig"); os.makedirs(d, exist_ok=True)
     # CAS (Client Application Server) provisioning. The phone needs BOTH casUrl
     # and authenticatorUrl set or it logs "CAS and/or Authenticator URLs are not
@@ -1026,31 +1048,33 @@ def write_phoneconfig():
                  f'casUrl=https://{MYIP}:5448\n'
                  f'authenticatorUrl=https://{MYIP}:5448\n'
                  f'sessionManagerUrl=https://{MYIP}:5448\n')
-    open(os.path.join(d, "generated.txt"), "w").write(sip_block() + cas_block)
-    # Embed the (single) phone's sipExtension in custom.txt (always fetched; changing
-    # its content forces the phone to re-read). Multi-phone uses per-MAC files below.
-    # The idle-screen name is two plain pphone.conf [user] keys, userFirstName and
-    # userLastName (confirmed on-device with a root shell). Serve them per phone,
-    # split from the label, so every phone shows its name with no CAS user-assignment.
+    _write_atomic(os.path.join(d, "generated.txt"), sip_block() + cas_block)
+    # The idle screen name is two plain pphone.conf [user] keys, userFirstName and
+    # userLastName (confirmed on-device with a root shell). They are split from the
+    # label and served per phone, so every phone shows its own name.
     def user_block(label, ext, with_tz=False):
         first, last = _split_name(label or ext or "")
         b = "[user]\n"
         if with_tz: b += f"timezone={TZ}\n"
         return b + f"userFirstName={first}\nuserLastName={last}\n"
-    one_ext = one_label = ""
-    if len(PHONES) == 1:
-        _one = next(iter(PHONES.values()))
-        one_ext = str(_one.get("extension", "")).strip()
-        one_label = _one.get("label", "")
-    open(os.path.join(d, "custom.txt"), "w").write(
-        sip_block(one_ext) + cas_block + user_block(one_label, one_ext, with_tz=True))
-    # Per-MAC config (fetched as custom_<MAC>.txt after custom.txt) sets each phone's
-    # own sipExtension and display name.
+    # custom.txt is served to every phone, including ones that are not assigned yet,
+    # so it must never carry a phone's identity. Each phone gets its own sipExtension
+    # and name from its own custom_<MAC>.txt below.
+    _write_atomic(os.path.join(d, "custom.txt"),
+                  sip_block() + cas_block + user_block("", "", with_tz=True))
+    wanted = set()
     for mac, p in list(PHONES.items()):
         ext = str(p.get("extension", "")).strip()
         if not ext: continue
-        open(os.path.join(d, f"custom_{mac.upper()}.txt"), "w").write(
-            sip_block(ext) + user_block(p.get("label", ""), ext))
+        name = f"custom_{mac.upper()}.txt"
+        wanted.add(name)
+        _write_atomic(os.path.join(d, name), sip_block(ext) + user_block(p.get("label", ""), ext))
+    # Remove per-phone files for phones that were deleted or reassigned, so the old
+    # identity is not served again.
+    for fn in os.listdir(d):
+        if re.fullmatch(r"custom_[0-9A-Fa-f]{12}\.txt", fn) and fn not in wanted:
+            try: os.remove(os.path.join(d, fn))
+            except OSError: pass
     cu = os.path.join(d, "country_US.txt")
     if not os.path.exists(cu):
         open(cu, "w").write('[site]\ndateFormatLong="\\\\a, \\\\b \\\\d \\\\Y"\n'
@@ -1076,10 +1100,12 @@ input{{padding:.35rem;border:1px solid #ccc;border-radius:4px}}
 button{{padding:.35rem .8rem;border:0;border-radius:4px;background:#2563eb;color:#fff;cursor:pointer}}
 button.d{{background:#ddd;color:#333}}
 .card{{background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:1rem;margin:.6rem 0}}
+.err{{background:#fef2f2;border:1px solid #fca5a5;color:#991b1b;border-radius:8px;padding:.6rem 1rem;margin:.6rem 0}}
 small{{color:#888}}
 </style></head><body>
 <h1>shorebridge <small>{ip}</small> <a href=/ style="font-size:.8rem;font-weight:400">&#8635; refresh</a></h1>
 <p><small>{connstatus}</small></p>
+{err}
 <h2>Configured phones</h2>
 <table><tr><th>MAC</th><th>Extension</th><th>Label</th><th>Online</th><th>Registered</th><th></th></tr>
 {rows}
@@ -1169,15 +1195,17 @@ def render():
 class AdminHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         if DEBUG: super().log_message(*a)
-    def _page(self, addmac=""):
+    def _page(self, addmac="", err=""):
         rowhtml, disc, catalog, connstatus, dirhtml = render()
+        errhtml = f"<div class=err>{html_escape(err)}</div>" if err else ""
         html = PAGE.format(ip=MYIP, rows=rowhtml, discovered=disc, addmac=addmac,
-                           cfg=PHONES_JSON, catalog=catalog, connstatus=connstatus, directory=dirhtml)
+                           cfg=PHONES_JSON, catalog=catalog, connstatus=connstatus, directory=dirhtml,
+                           err=errhtml)
         self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
         self.wfile.write(html.encode())
     def do_GET(self):
         q = parse_qs(urlparse(self.path).query)
-        self._page(addmac=q.get("add", [""])[0])
+        self._page(addmac=q.get("add", [""])[0], err=q.get("err", [""])[0])
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0)); body = self.rfile.read(n).decode()
         f = {k: v[0] for k, v in parse_qs(body).items()}
@@ -1225,16 +1253,27 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             password = f.get("password", "") or (rec.password if rec else "")
             label = f.get("label", "").strip() or (rec.display_name if rec else "")
             if mac and ext and password:
+                # Two phones must never share one extension. The bridge registers each
+                # extension once and routes inbound calls to a single phone.
+                with pstate:
+                    clash = next((m for m, p in PHONES.items()
+                                  if m != mac and str(p.get("extension", "")).strip() == ext), None)
+                if clash:
+                    msg = f"Extension {ext} is already assigned to phone {clash}. Remove that phone first or pick a different extension."
+                    log(f"UI: Rejected {mac}, extension {ext} is already used by {clash}")
+                    self.send_response(303); self.send_header("Location", "/?err=" + quote(msg)); self.end_headers()
+                    return
                 with pstate:
                     PHONES[mac] = {"extension": ext, "auth_id": authid, "password": password, "label": label}
                     SEEN.pop(mac, None)
-                save_phones(); ensure_registrations(); log(f"UI: saved phone {mac} -> ext {ext}")
+                save_phones(); ensure_registrations(); write_phoneconfig()
+                log(f"UI: saved phone {mac} -> ext {ext}. Reboot the phone to pick up its new identity.")
             else:
                 log(f"UI: incomplete add for {mac} (need extension + password)")
         elif path == "/delete":
             mac = norm_mac(f.get("mac", ""))
             with pstate: PHONES.pop(mac, None)
-            save_phones(); log(f"UI: removed phone {mac}")
+            save_phones(); write_phoneconfig(); log(f"UI: removed phone {mac}")
         elif path == "/dir-add":
             name = f.get("name", "").strip(); number = f.get("number", "").strip()
             typ = f.get("type", "mobile").strip() or "mobile"

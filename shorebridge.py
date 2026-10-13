@@ -44,7 +44,7 @@ DOMAIN   = CFG.get("pbx", "domain")
 _bind    = CFG.get("bridge", "bind_ip", fallback="auto").strip()
 MYIP     = detect_ip(SBC_IP) if _bind in ("", "auto") else _bind
 DATA     = CFG.get("bridge", "data_dir", fallback="/opt/shorebridge")
-TZ       = CFG.get("phone", "timezone", fallback="Eastern Standard Time")
+TZ       = CFG.get("phone", "timezone", fallback="Central Standard Time")
 DEBUG    = CFG.getboolean("bridge", "debug", fallback=False)
 UI_PORT  = CFG.getint("bridge", "ui_port", fallback=8910)
 CSTA_AUTOANSWER = CFG.getboolean("bridge", "csta_test_autoanswer", fallback=False)  # test: auto-fire AnswerCall on inbound ring

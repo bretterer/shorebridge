@@ -78,7 +78,7 @@ else
   ask "PBX / 3CX SBC IP (same box as SBC? use this host's LAN IP)" "$BIND_IP" SBC_IP
   ask "PBX SIP port"                      "5060"             SBC_PORT
   ask "Registrar domain (3CX: NNN.3cx.cloud; FreePBX: PBX IP)" "$SBC_IP" DOMAIN
-  ask "Phone timezone"                    "Eastern Standard Time" TZ
+  ask "Phone timezone"                    "Central Standard Time" TZ
   # Per-phone extension/auth/password are assigned later in the web UI, not here.
 fi
 

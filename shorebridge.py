@@ -55,11 +55,6 @@ CSTA_AUTOANSWER = CFG.getboolean("bridge", "csta_test_autoanswer", fallback=Fals
 # at all for a very long time. Dead peers are detected by TCP keepalive instead.
 PHONE_POLL = 15
 PHONE_IDLE_LIMIT = CFG.getint("bridge", "phone_idle_limit", fallback=7500)
-# Phone models that must not be given CAS URLs (comma separated, as in custom_<MODEL>.txt).
-# The IP420 asks for a CAS session in a different format than the IP480 and can hang on
-# "Requesting service" when it does not understand our answer. Set no_cas_models to an
-# empty value in the [phone] section of config.ini to give CAS to every model again.
-NO_CAS_MODELS = [m.strip() for m in CFG.get("phone", "no_cas_models", fallback="IP420").split(",") if m.strip()]
 
 HTTP_ROOT = os.path.join(DATA, "www")
 CERT = os.path.join(DATA, "tls", "switch_fullchain.crt")
@@ -1221,17 +1216,10 @@ def _write_phoneconfig():
         name = f"custom_{mac.upper()}.txt"
         wanted.add(name)
         _write_atomic(os.path.join(d, name), sip_block(ext) + user_block(p.get("label", ""), ext))
-    # Per model files (the phone asks for custom_<MODEL>.txt, for example custom_IP420.txt,
-    # after custom.txt). Models in no_cas_models get empty CAS URLs, which is how an
-    # unprovisioned phone looks, so they never start a CAS session with us.
-    for model in NO_CAS_MODELS:
-        name = f"custom_{model}.txt"
-        wanted.add(name)
-        _write_atomic(os.path.join(d, name), "[cas]\ncasUrl=\nauthenticatorUrl=\nsessionManagerUrl=\n")
-    # Remove per-phone and per-model files that are no longer wanted (deleted or reassigned
-    # phones, or a model taken out of no_cas_models), so old settings are not served again.
+    # Remove per-phone files for phones that were deleted or reassigned, so the old
+    # identity is not served again.
     for fn in os.listdir(d):
-        if re.fullmatch(r"custom_([0-9A-Fa-f]{12}|IP[0-9]+[A-Za-z]*)\.txt", fn) and fn not in wanted:
+        if re.fullmatch(r"custom_[0-9A-Fa-f]{12}\.txt", fn) and fn not in wanted:
             try: os.remove(os.path.join(d, fn))
             except OSError: pass
     cu = os.path.join(d, "country_US.txt")

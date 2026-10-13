@@ -49,6 +49,18 @@ DEBUG    = CFG.getboolean("bridge", "debug", fallback=False)
 UI_PORT  = CFG.getint("bridge", "ui_port", fallback=8910)
 CSTA_AUTOANSWER = CFG.getboolean("bridge", "csta_test_autoanswer", fallback=False)  # test: auto-fire AnswerCall on inbound ring
 
+# Phone signaling connection tuning. Each phone keeps one long lived TLS connection to us.
+# PHONE_POLL is how often the read loop wakes up (it is also the write timeout).
+# PHONE_IDLE_LIMIT is only a last resort backstop for a connection that carried no data
+# at all for a very long time. Dead peers are detected by TCP keepalive instead.
+PHONE_POLL = 15
+PHONE_IDLE_LIMIT = CFG.getint("bridge", "phone_idle_limit", fallback=7500)
+# Phone models that must not be given CAS URLs (comma separated, as in custom_<MODEL>.txt).
+# The IP420 asks for a CAS session in a different format than the IP480 and can hang on
+# "Requesting service" when it does not understand our answer. Set no_cas_models to an
+# empty value in the [phone] section of config.ini to give CAS to every model again.
+NO_CAS_MODELS = [m.strip() for m in CFG.get("phone", "no_cas_models", fallback="IP420").split(",") if m.strip()]
+
 HTTP_ROOT = os.path.join(DATA, "www")
 CERT = os.path.join(DATA, "tls", "switch_fullchain.crt")
 KEY  = os.path.join(DATA, "tls", "switch.key")
@@ -83,6 +95,7 @@ def md5(s): return hashlib.md5(s.encode()).hexdigest()
 # REGOK:   extension -> bool   last registration result toward the PBX
 PHONES = {}; CONNS = {}; CONTACTS = {}; SEEN = {}; REGOK = {}
 PHONE_IPS = {}                       # mac -> last source IP (to map CAS clients -> extension)
+LAST_REGISTER = {}                   # mac -> time of the last REGISTER (for the diagnostics)
 reg_threads = {}
 pstate = threading.Lock()
 
@@ -159,8 +172,8 @@ def build_bye(leg):
     if leg["transport"] == "TLS":
         c = leg.get("conn")
         if c:
-            try: c.sendall(data)
-            except Exception: pass
+            try: csend(c, data)
+            except Exception as e: dbg(f"BYE to phone not sent: {e!r}")
     else:
         u3.sendto(data, SBC)
     log(f"sent BYE ({leg['transport']}) callid {leg['callid'][:8]}")
@@ -179,6 +192,7 @@ def wait(callid, timeout):
         q = waiters.get(callid) or []; return q[-1] if q else None
 
 def reg_loop(ext):
+    last_ok = None
     while True:
         # resolve current creds for this extension; exit if the phone was removed
         creds = None
@@ -212,6 +226,12 @@ def reg_loop(ext):
         ok = bool(r and " 200 " in r.split("\r\n")[0])
         with pstate: REGOK[ext] = ok
         dbg(f"ext {ext} registration: " + ("OK" if ok else "FAILED"))
+        if ok != last_ok:
+            # Always log a change, a PBX registration that drops makes every dial fail.
+            if ok: state = "OK"
+            else: state = "FAILED (" + (r.split("\r\n")[0] if r else "no response from the PBX") + ")"
+            log(f"PBX registration for ext {ext} is now {state}")
+            last_ok = ok
         time.sleep(90 if ok else 15)
 
 def ensure_registrations():
@@ -343,7 +363,7 @@ class CallSession:
                          f"Via: SIP/2.0/TLS {MYIP}:5061;branch={iv['branch']};rport", "Max-Forwards: 70",
                          f"From: {iv['from']}", f"To: <{iv['contact']}>",
                          f"Call-ID: {iv['callid']}", "CSeq: 1 CANCEL", "Content-Length: 0"]
-                    iv["conn"].sendall(("\r\n".join(L) + "\r\n\r\n").encode())
+                    csend(iv["conn"], ("\r\n".join(L) + "\r\n\r\n").encode())
                     log("sent CANCEL to phone (caller hung up before answer)")
                 except Exception as e: log("cancel phone err " + repr(e))
         if origin != "3cx" and s.x_dialog:
@@ -400,8 +420,8 @@ def wait_invite(callid, timeout, cseq=None, cs=None):
             if code >= 200: return m
             if code in (180, 183) and cs is not None and not rang:
                 rang = True
-                try: cs.pc.sendall(p_resp(180, "Ringing", cs.ph, cs.p_addr, "INVITE"))
-                except Exception: pass
+                try: csend(cs.pc, p_resp(180, "Ringing", cs.ph, cs.p_addr, "INVITE"))
+                except Exception as e: dbg(f"Ringing to phone not sent: {e!r}")
             last = m
         time.sleep(0.05)
     return last
@@ -445,14 +465,51 @@ def p_resp(code, reason, hdrs, addr, method, sdp=None):
         return ("\r\n".join(L) + "\r\n\r\n").encode() + b
     L.append("Content-Length: 0"); return ("\r\n".join(L) + "\r\n\r\n").encode()
 
+def enable_keepalive(sock):
+    # Let the kernel notice a phone that vanished without closing TCP (power cut, cable
+    # pulled). This replaces closing quiet but healthy phones after an idle timeout.
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, val in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4)):
+            if hasattr(socket, name):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), val)
+    except OSError as e:
+        dbg(f"Could not set TCP keepalive: {e!r}")
+
+def csend(conn, data):
+    """Write to a phone connection. Several threads write to the same TLS socket (the
+    read loop answering NOTIFY, call workers sending 100/200, BYE/CANCEL from the PBX
+    side). OpenSSL does not allow two threads to write to one TLS connection at once,
+    so every write goes through a per connection lock."""
+    lk = getattr(conn, "sb_send_lock", None)
+    try:
+        if lk is None:
+            conn.sendall(data)
+        else:
+            with lk:
+                conn.sendall(data)
+    except socket.timeout:
+        # A write that timed out half way leaves the TLS stream in an unusable state,
+        # so drop the connection and let the phone reconnect cleanly.
+        log(f"Phone write timed out after {PHONE_POLL}s, dropping the connection")
+        try: conn.close()
+        except Exception: pass
+        raise
+
 def phone_send(conn, data):
     """Send on a phone dialog, tolerating a peer that closed the TLS socket."""
     try:
-        conn.sendall(data)
+        csend(conn, data)
         return True
     except (OSError, ssl.SSLError) as e:
-        dbg(f"phone socket closed while sending: {e!r}")
+        dbg(f"Phone socket closed while sending: {e!r}")
         return False
+
+def mac_for_ip(ip):
+    # Identify a phone by the IP it registered from. Used when a connection sends a
+    # request before it has sent a REGISTER on that same connection.
+    macs = [m for m, i in list(PHONE_IPS.items()) if i == ip]
+    return macs[0] if len(macs) == 1 else None
 
 def phone_invite_worker(conn, mac, hdrs, body, addr):
     try:
@@ -468,10 +525,13 @@ def phone_invite(conn, mac, hdrs, body, addr):
     to = H(hdrs, "to"); m = re.search(r'sips?:([^@>]+)@', to); dst = m.group(1) if m else "0"
     creds = creds_for_mac(mac)
     if not creds:
-        log(f"unconfigured phone {mac} tried to dial {dst}")
+        # The phone shows "Action not permitted" when it gets this 403, so say exactly why.
+        log(f"Refusing dial to {dst} with 403: phone {mac or 'unidentified'} at {addr[0]} has no extension "
+            f"assigned (assigned phones: {sorted(PHONES)}, last known IPs: {dict(PHONE_IPS)})")
         phone_send(conn, p_resp(403, "Forbidden", hdrs, addr, "INVITE")); return
     ext, authid, password = creds
     log(f"phone {mac} (ext {ext}) dialed {dst}")
+    dbg(f"Dial from {mac}: ext {ext} pbx_registered={REGOK.get(ext)} conn_in_table={CONNS.get(mac) is conn}")
     cs = CallSession(dst, conn, mac, ext, authid, password)
     cs.p_callid = H(hdrs, "call-id"); cs.ph = hdrs; cs.p_addr = addr; cs.phone_rtp = sdp_media(body)
     cs.phone_dtmf_pt = sdp_telephone_event(body)
@@ -504,7 +564,12 @@ def register_phone(conn, hdrs, addr):
     """Handle a phone REGISTER: identify by MAC, attach its connection; unknown MACs go to SEEN for the UI."""
     mac = mac_from_contact(H(hdrs, "contact")) or ("ip-" + addr[0].replace(".", "-"))
     ct = uri_of(H(hdrs, "contact"))
+    now = time.time()
     with pstate:
+        old = CONNS.get(mac)
+        prev = LAST_REGISTER.get(mac); LAST_REGISTER[mac] = now
+        if old is not None and old is not conn:
+            log(f"Phone {mac} registered on a new connection while its previous connection is still open")
         CONNS[mac] = conn
         # Drop stale entries for other phones that used this IP before (DHCP churn),
         # otherwise the CAS lookup by IP can return the wrong phone's identity.
@@ -519,37 +584,57 @@ def register_phone(conn, hdrs, addr):
             SEEN[mac] = {"ip": addr[0], "ts": int(time.time())}; known = False
     if not known:
         log(f"unconfigured phone seen: {mac} ({addr[0]}) - assign it at http://{MYIP}:{UI_PORT}")
+    gap = f"{int(now - prev)}s after its previous REGISTER" if prev else "first REGISTER since the bridge started"
+    log(f"Phone {mac} registered from {addr[0]} ({gap}, user agent {H(hdrs, 'user-agent') or 'unknown'})")
     return mac
 
 def phone_handle(conn, addr):
-    mymac = None; buf = b""; conn.settimeout(300)
+    mymac = None; buf = b""; conn.settimeout(PHONE_POLL)
+    t0 = time.time(); warned = False; reason = "unknown"
+    st = getattr(conn, "sb_stats", None)
+    if st is None: st = {"rx": 0, "msgs": 0, "last_rx": t0, "last_msg": "none"}
+    log(f"Phone connection opened from {addr[0]}:{addr[1]}")
     try:
         while True:
             while buf[:2] == b"\r\n": buf = buf[2:]
             if b"\r\n\r\n" not in buf:
                 try: d = conn.recv(4096)
                 except socket.timeout:
-                    # A phone that disappears without closing TCP must not remain
-                    # in CONNS forever; the finally block below removes it.
-                    return
-                if not d: return
-                if d.strip(b"\r\n") == b"" and buf == b"": conn.sendall(b"\r\n"); continue
+                    # A quiet phone is normal, so a read timeout just loops. Phones that
+                    # vanished without closing TCP are caught by TCP keepalive. Only a
+                    # very long silence ends the connection here.
+                    idle = time.time() - st["last_rx"]
+                    if idle > PHONE_IDLE_LIMIT:
+                        reason = f"no data for {int(idle)}s (idle backstop)"; return
+                    continue
+                if not d:
+                    reason = "closed by the phone (EOF)"; return
+                st["rx"] += len(d); st["last_rx"] = time.time()
+                if d.strip(b"\r\n") == b"" and buf == b"":
+                    st["last_msg"] = "keepalive"; csend(conn, b"\r\n"); continue
                 buf += d; continue
             head, _, rest = buf.partition(b"\r\n\r\n")
-            if head.strip() == b"": conn.sendall(b"\r\n"); buf = rest; continue
+            if head.strip() == b"": csend(conn, b"\r\n"); buf = rest; continue
             cl = 0
             for line in head.decode("utf-8", "replace").split("\r\n"):
                 if line.lower().startswith("content-length:"):
                     try: cl = int(line.split(":", 1)[1].strip() or 0)
                     except Exception: cl = 0
+            deadline = time.time() + 60
             while len(rest) < cl:
-                d = conn.recv(4096)
+                try: d = conn.recv(4096)
+                except socket.timeout:
+                    if time.time() > deadline: raise
+                    continue
                 if not d: break
+                st["rx"] += len(d); st["last_rx"] = time.time()
                 rest += d
             body = rest[:cl]; buf = rest[cl:]
             msg = (head + b"\r\n\r\n" + body).decode("utf-8", "replace")
             start, hdrs, b = parse(msg); parts = start.split()
             if not parts: continue
+            st["msgs"] += 1
+            st["last_msg"] = ("response " + parts[1]) if start.startswith("SIP/2.0") and len(parts) > 1 else parts[0]
             if DEBUG:   # full capture of the phone->switch channel (uaCSTA dialog, bodies)
                 dbg("PHONE >>>>\n" + msg.strip() + "\n<<<< end")
             if start.startswith("SIP/2.0"):
@@ -568,28 +653,42 @@ def phone_handle(conn, addr):
                                f"Via: SIP/2.0/TLS {MYIP}:5061;branch={iv['branch']}", "Max-Forwards: 70",
                                f"From: {iv['from']}", f"To: {H(hdrs,'to')}",
                                f"Call-ID: {cid}", f"CSeq: {cseqn} ACK", "Content-Length: 0"]
-                        try: conn.sendall(("\r\n".join(ack) + "\r\n\r\n").encode())
-                        except Exception: pass
+                        try: csend(conn, ("\r\n".join(ack) + "\r\n\r\n").encode())
+                        except Exception as e: dbg(f"ACK to phone not sent: {e!r}")
                 continue
             method = parts[0]
             if method == "ACK": continue
+            if not mymac and method != "REGISTER":
+                # A phone that reconnected may send a request before it registers on the new
+                # connection. Identify it by IP instead of treating it as an unknown phone.
+                mymac = mac_for_ip(addr[0])
+                if mymac:
+                    with pstate: CONNS.setdefault(mymac, conn)
+                if not warned:
+                    warned = True
+                    if mymac: log(f"Connection from {addr[0]} sent {method} before any REGISTER, identified phone {mymac} by its IP")
+                    else: log(f"Connection from {addr[0]} sent {method} before any REGISTER and no phone is known at that IP")
             if method == "REGISTER":
                 mymac = register_phone(conn, hdrs, addr)
-                conn.sendall(p_resp(200, "OK", hdrs, addr, method))
+                csend(conn, p_resp(200, "OK", hdrs, addr, method))
             elif method == "INVITE":
                 threading.Thread(target=phone_invite_worker, args=(conn, mymac, hdrs, b, addr), daemon=True).start()
             elif method == "BYE":
                 cs = CALLS.get(H(hdrs, "call-id"))
-                conn.sendall(p_resp(200, "OK", hdrs, addr, method))
+                csend(conn, p_resp(200, "OK", hdrs, addr, method))
                 if cs: cs.teardown(origin="phone")
             else:
-                conn.sendall(p_resp(200, "OK", hdrs, addr, method))
+                csend(conn, p_resp(200, "OK", hdrs, addr, method))
     except Exception as e:
+        reason = f"error {type(e).__name__}: {e}"
         log(f"phone conn err {repr(e)}")
     finally:
+        now = time.time()
         if mymac:
             with pstate:
                 if CONNS.get(mymac) is conn: CONNS.pop(mymac, None)
+        log(f"Phone connection closed: peer={addr[0]}:{addr[1]} mac={mymac or 'none'} reason={reason} "
+            f"age={int(now - t0)}s idle={int(now - st['last_rx'])}s messages={st['msgs']} last={st['last_msg']}")
         try: conn.close()
         except Exception: pass
 
@@ -816,7 +915,12 @@ def cas_handle(conn, addr):
                 log("CAS REQUEST >>>>\n" + f"{method} {target}\n" + raw +
                     (("\n\n" + body) if body else "") + "\n<<<< end")
             result = cas_dispatch(method, target, body, client_ip=addr[0])
+            if urlparse(target).path in ("/", "") and method == "POST":
+                m = re.search(r'"app-id"\s*:\s*"([^"]*)"', body or "")
+                log(f"CAS session request from {addr[0]} (app-id {m.group(1) if m else 'unknown'}, "
+                    f"known extension {phone_for_ip(addr[0])[0] or 'none'}), answering {str(result)[:200]}")
             if result is UNAUTH:                    # stale session -> 401 forces a re-login
+                log(f"CAS answering 401 to {addr[0]} for {urlparse(target).path} (session not known to this bridge)")
                 b401 = b'{"error":401,"message":"session invalid"}'
                 conn.sendall(b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n"
                              b"Content-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(b401), b401))
@@ -840,6 +944,7 @@ def cas_handle(conn, addr):
                 else:
                     result = {"events": []}
             payload = json.dumps(result).encode()
+            dbg(f"CAS reply to {addr[0]}: {payload[:300].decode('utf-8', 'replace')}")
             keep = "keep-alive" in headers.get("connection", "").lower()
             conn.sendall(
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
@@ -847,8 +952,9 @@ def cas_handle(conn, addr):
                 % (len(payload), b"keep-alive" if keep else b"close", payload))
             if not keep: break
     except Exception as e:
-        if DEBUG: log("CAS err " + repr(e))
+        dbg(f"CAS connection from {addr[0]} ended with error {e!r}")
     finally:
+        dbg(f"CAS connection from {addr[0]}:{addr[1]} closed")
         try: conn.close()
         except Exception: pass
 
@@ -871,11 +977,15 @@ def tls_server(port, handler):
         try:
             c, a = s.accept()
             if DEBUG: dbg(f"TCP connect :{port} from {a[0]}")
+            enable_keepalive(c)
             try:
                 tc = ctx.wrap_socket(c, server_side=True)
+                tc.sb_send_lock = threading.Lock()
+                tc.sb_stats = {"rx": 0, "msgs": 0, "last_rx": time.time(), "last_msg": "none", "since": time.time()}
                 threading.Thread(target=handler, args=(tc, a), daemon=True).start()
-            except ssl.SSLError as e:
-                if DEBUG: dbg(f"TLS handshake FAILED :{port} from {a[0]}: {e}")
+            except (ssl.SSLError, OSError) as e:
+                # Always log this. A phone that cannot finish the handshake never gets service.
+                log(f"TLS handshake failed on :{port} from {a[0]}: {e}")
                 try: c.close()
                 except Exception: pass
         except Exception as e:
@@ -913,8 +1023,9 @@ def inbound_invite(xh, xraw, xaddr):
         "Content-Type: application/sdp", f"Content-Length: {len(b)}"]) + "\r\n\r\n").encode() + b
     with pinlock: PIN[cs.p_callid] = []
     log(f"inbound from {caller} -> ext {ext} (ringing phone {mac})")
-    try: conn.sendall(inv)
-    except Exception:
+    try: csend(conn, inv)
+    except Exception as e:
+        log(f"Could not deliver inbound call to phone {mac}: {e!r}")
         u3.sendto(resp_line(480, "Unavailable", xh).encode(), xaddr); cs.teardown(); return
     if CSTA_AUTOANSWER:   # test mode: fire AnswerCall ~3s into the ring to prove it answers
         def _autoanswer():
@@ -944,8 +1055,8 @@ def inbound_invite(xh, xraw, xaddr):
         f"ACK {phone_uri} SIP/2.0", f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)}",
         "Max-Forwards: 70", f"From: <sips:{caller}@{MYIP}>;tag={cs.p_ftag}", f"To: {cs.p_totag}",
         f"Call-ID: {cs.p_callid}", "CSeq: 1 ACK", "Content-Length: 0"]) + "\r\n\r\n").encode()
-    try: conn.sendall(ack)
-    except Exception: pass
+    try: csend(conn, ack)
+    except Exception as e: log(f"Could not send ACK to phone {mac}: {e!r}")
     threading.Thread(target=cs.relay, daemon=True).start()
     osdp = ("v=0\r\n" f"o=bridge 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
             f"m=audio {cs.rp3} RTP/AVP 0 101\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:101 telephone-event/8000\r\n" "a=sendrecv\r\n")
@@ -1039,7 +1150,7 @@ def send_to_phone_csta(mac, body):
         "Content-Type: application/csta+xml", f"Content-Length: {len(b)}"]) + "\r\n\r\n").encode() + b
     with pinlock: PIN[callid] = []
     log(f"CSTA >> phone {mac}:\n{body}")
-    try: conn.sendall(msg)
+    try: csend(conn, msg)
     except Exception as e:
         with pinlock: PIN.pop(callid, None)
         return f"(send error: {e})"
@@ -1110,10 +1221,17 @@ def _write_phoneconfig():
         name = f"custom_{mac.upper()}.txt"
         wanted.add(name)
         _write_atomic(os.path.join(d, name), sip_block(ext) + user_block(p.get("label", ""), ext))
-    # Remove per-phone files for phones that were deleted or reassigned, so the old
-    # identity is not served again.
+    # Per model files (the phone asks for custom_<MODEL>.txt, for example custom_IP420.txt,
+    # after custom.txt). Models in no_cas_models get empty CAS URLs, which is how an
+    # unprovisioned phone looks, so they never start a CAS session with us.
+    for model in NO_CAS_MODELS:
+        name = f"custom_{model}.txt"
+        wanted.add(name)
+        _write_atomic(os.path.join(d, name), "[cas]\ncasUrl=\nauthenticatorUrl=\nsessionManagerUrl=\n")
+    # Remove per-phone and per-model files that are no longer wanted (deleted or reassigned
+    # phones, or a model taken out of no_cas_models), so old settings are not served again.
     for fn in os.listdir(d):
-        if re.fullmatch(r"custom_[0-9A-Fa-f]{12}\.txt", fn) and fn not in wanted:
+        if re.fullmatch(r"custom_([0-9A-Fa-f]{12}|IP[0-9]+[A-Za-z]*)\.txt", fn) and fn not in wanted:
             try: os.remove(os.path.join(d, fn))
             except OSError: pass
     cu = os.path.join(d, "country_US.txt")
@@ -1334,6 +1452,23 @@ def admin_server():
     log(f"admin UI on http://{MYIP}:{UI_PORT}")
     httpd.serve_forever()
 
+def status_loop():
+    # Only runs when debug = true. One line per phone every minute, so a log shows exactly
+    # when a phone went quiet or lost its connection, even if nothing else happened.
+    while True:
+        time.sleep(60)
+        now = time.time()
+        for mac, p in list(PHONES.items()):
+            conn = CONNS.get(mac); ext = p.get("extension", "")
+            if conn is None:
+                if mac in LAST_REGISTER: seen = f"last REGISTER {int(now - LAST_REGISTER[mac])}s ago"
+                else: seen = "no REGISTER since the bridge started"
+                dbg(f"Status: phone {mac} ext {ext} has NO connection, {seen}, pbx_registered={REGOK.get(ext)}")
+                continue
+            st = getattr(conn, "sb_stats", {})
+            dbg(f"Status: phone {mac} ext {ext} connected {int(now - st.get('since', now))}s, silent for "
+                f"{int(now - st.get('last_rx', now))}s, last message {st.get('last_msg')}, pbx_registered={REGOK.get(ext)}")
+
 def refresh_catalog():
     global CATALOG
     while True:
@@ -1359,6 +1494,7 @@ def main():
     threading.Thread(target=u3_recv, daemon=True).start()
     threading.Thread(target=tls_server, args=(5061, phone_handle), daemon=True).start()
     threading.Thread(target=tls_server, args=(5448, cas_handle), daemon=True).start()
+    if DEBUG: threading.Thread(target=status_loop, daemon=True).start()
     log(f"shorebridge ready - admin UI: http://{MYIP}:{UI_PORT}")
     threading.Event().wait()
 

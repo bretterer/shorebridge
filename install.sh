@@ -189,7 +189,8 @@ cat <<EOF
   "New phones seen" for one-click assignment.
 
   Manage it:
-    shorebridge update     update to the latest version + restart
+    shorebridge update [--branch NAME]
+                           update from NAME (default: main) + restart
     shorebridge logs       follow the log
     shorebridge config     edit settings
     shorebridge ui         print the admin UI url

@@ -71,11 +71,12 @@ Point a new phone's Config Server at the bridge; it shows up in the UI under **"
 The installer drops a `shorebridge` CLI:
 
 ```bash
-sudo shorebridge update     # pull the latest version (pinned to newest commit) and restart
-shorebridge logs            # follow the service log
-shorebridge status          # service status
-sudo shorebridge config     # edit settings
-shorebridge ui              # print the admin UI url
+sudo shorebridge update --branch develop  # pull a specific branch
+sudo shorebridge update                   # pull main (pinned to newest commit) and restart
+shorebridge logs                          # follow the service log
+shorebridge status                        # service status
+sudo shorebridge config                   # edit settings
+shorebridge ui                            # print the admin UI url
 ```
 
 ### Uninstall / reinstall

@@ -70,14 +70,9 @@ case "$cmd" in
       esac
     done
     # pin to the newest commit so GitHub's raw CDN can't serve a stale copy
-    cur="$(cat "$PREFIX/.version" 2>/dev/null || true)"
     sha="$(curl -fsSL "$API/commits/$branch" 2>/dev/null | grep -m1 '"sha"' | cut -d'"' -f4 || true)"
     ref="${sha:-$branch}"
-    if [ -n "$cur" ] && [ "$cur" = "$ref" ]; then
-      echo "Already on the latest version (${ref:0:12}); reapplying."
-    else
-      echo "Updating ${cur:0:12}${cur:+ -> }${ref:0:12} ..."
-    fi
+    echo "Updating from $branch (${ref:0:12}) ..."
     tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
     for f in $FILES; do
       curl -fsSL "$RAW/$ref/$f" -o "$tmp/$f"
@@ -104,10 +99,9 @@ case "$cmd" in
     fi
     # self-update the CLI too (safe: Linux lets us replace a running script)
     curl -fsSL "$RAW/$ref/bin/shorebridge" -o "$tmp/cli" 2>/dev/null && install -m 0755 "$tmp/cli" /usr/local/bin/shorebridge || true
-    printf '%s\n' "$ref" > "$PREFIX/.version"
     systemctl restart shorebridge
     sleep 1
-    if systemctl is-active --quiet shorebridge; then echo "now on ${ref:0:12}, restarted."; else
+    if systemctl is-active --quiet shorebridge; then echo "updated and restarted."; else
       echo "updated, but service not active - check: shorebridge logs" >&2; fi
     ;;
   repair)
@@ -128,10 +122,6 @@ case "$cmd" in
   start)    need_root start; systemctl start shorebridge; echo "started." ;;
   config)   need_root config; "${EDITOR:-nano}" "$ETC/config.ini"; echo "run 'shorebridge restart' to apply." ;;
   ui)       echo "http://$(bind_ip || echo localhost):8910" ;;
-  version)
-    echo "shorebridge $(cut -c1-12 "$PREFIX/.version" 2>/dev/null || echo unknown)"
-    echo "pjsua2 $("$VENV/bin/python" -c 'import pjsua2; print(pjsua2.Endpoint().libVersion().full)' 2>/dev/null || echo missing)"
-    ;;
   uninstall)
     need_root uninstall
     purge=false; case "${2:-}" in --purge|--full|--all) purge=true;; esac
@@ -166,7 +156,6 @@ shorebridge - control CLI
   shorebridge logs       follow the service log   (shorebridge logs -n 50 for last 50)
   shorebridge status     systemd service status
   shorebridge repair     rebuild the virtualenv and pjsua2, then restart
-  shorebridge version    show the installed shorebridge and pjsua2 versions
   shorebridge restart    restart the service
   shorebridge start|stop start / stop the service
   shorebridge config     edit /etc/shorebridge/config.ini

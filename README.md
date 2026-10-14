@@ -16,8 +16,8 @@ shorebridge is a small **back-to-back user agent (B2BUA)** that wears two faces:
 The phone thinks it's talking to its mothership; the PBX thinks it's talking to a softphone. In between, shorebridge bridges the two calls. The phone side keeps its own hand-written SIP and RTP (plain PCMU, no SRTP). Audio from the phone is decoded to PCM and handed to pjsua2, and audio from pjsua2 is encoded back to PCMU for the phone. DTMF is carried both ways as RFC 4733 telephone-events.
 
 ```
-  ShoreTel IP480 --TLS/SIP(5061)--> shorebridge --pjsua2 UDP/SIP--> your PBX / 3CX SBC
-       (cert-pinned)               (fake switch + B2BUA)            (normal extension)
+  ShoreTel IP480 ──TLS/SIP(5061)──▶ shorebridge ──UDP/SIP(5060)──▶ your PBX / 3CX SBC
+       (cert-pinned)                (fake switch + B2BUA)            (normal extension)
 ```
 
 ### The trust trick (the part that makes it possible)
@@ -79,7 +79,6 @@ sudo shorebridge update                   # pull main (pinned to newest commit) 
 shorebridge logs                          # follow the service log
 shorebridge status                        # service status
 sudo shorebridge repair                   # rebuild the venv and pjsua2, then restart
-shorebridge version                       # shorebridge and pjsua2 versions
 sudo shorebridge config                   # edit settings
 shorebridge ui                            # print the admin UI url
 ```

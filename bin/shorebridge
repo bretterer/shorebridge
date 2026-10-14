@@ -9,6 +9,40 @@ RAW="https://raw.githubusercontent.com/$REPO"
 API="https://api.github.com/repos/$REPO"
 
 need_root(){ [ "$(id -u)" -eq 0 ] || { echo "shorebridge $1: run with sudo" >&2; exit 1; }; }
+VENV="$PREFIX/venv"
+APT_PKGS="python3 python3-venv python3-pip python3-dev build-essential swig git curl openssl libssl-dev libasound2-dev pkg-config iproute2 ca-certificates"
+FILES="shorebridge.py media.py pbx.py connectors.py build_pjsua2.sh requirements.txt"
+
+# Install missing system packages needed for the venv and the pjsua2 build.
+ensure_apt(){
+  command -v apt-get >/dev/null 2>&1 || return 0
+  local missing="" p
+  for p in $APT_PKGS; do dpkg -s "$p" >/dev/null 2>&1 || missing="$missing $p"; done
+  [ -n "$missing" ] || return 0
+  echo "Installing system packages:$missing"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq $missing >/dev/null || apt-get install -y -qq ${missing/libasound2-dev/} >/dev/null
+}
+
+# Make sure the venv exists and matches the system python, then build pjsua2 if needed.
+# Usage: ensure_env <build script> [force]
+ensure_env(){
+  local build="$1" force="${2:-}" want have
+  ensure_apt
+  want="$(python3 -c 'import sys;print("%d.%d" % sys.version_info[:2])')"
+  if [ -d "$VENV" ]; then
+    have="$("$VENV/bin/python" -c 'import sys;print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+    if [ "$have" != "$want" ] || [ "$force" = force ]; then
+      echo "Recreating the virtualenv (python ${have:-broken} -> $want)"
+      rm -rf "$VENV"
+    fi
+  fi
+  [ -d "$VENV" ] || python3 -m venv "$VENV"
+  "$VENV/bin/pip" install --quiet --upgrade pip setuptools wheel
+  SB_FORCE_BUILD="$([ "$force" = force ] && echo 1 || echo 0)" bash "$build" "$VENV"
+}
+
 bind_ip(){ grep -E '^\s*bind_ip' "$ETC/config.ini" 2>/dev/null | head -1 | sed 's/.*=\s*//' | tr -d '[:space:]'; }
 
 cmd="${1:-help}"
@@ -45,13 +79,25 @@ case "$cmd" in
       echo "Updating ${cur:0:12}${cur:+ -> }${ref:0:12} ..."
     fi
     tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-    for f in shorebridge.py connectors.py; do
+    for f in $FILES; do
       curl -fsSL "$RAW/$ref/$f" -o "$tmp/$f"
     done
-    python3 -c "import ast,sys; [ast.parse(open(f).read()) for f in sys.argv[1:]]" "$tmp/shorebridge.py" "$tmp/connectors.py" \
+    python3 -c "import ast,sys; [ast.parse(open(f).read()) for f in sys.argv[1:]]" \
+      "$tmp/shorebridge.py" "$tmp/media.py" "$tmp/pbx.py" "$tmp/connectors.py" \
       || { echo "downloaded code failed to parse; aborting (service untouched)" >&2; exit 1; }
+    # Prepare the python environment first. The running service is not touched yet,
+    # so a failed build leaves the old version working.
+    ensure_env "$tmp/build_pjsua2.sh" \
+      || { echo "python environment setup failed; aborting (service untouched)" >&2; exit 1; }
+    if grep -qE '^[[:space:]]*[A-Za-z0-9]' "$tmp/requirements.txt"; then
+      "$VENV/bin/pip" install --quiet -r "$tmp/requirements.txt"
+    fi
     install -m 0755 "$tmp/shorebridge.py" "$PREFIX/shorebridge.py"
+    install -m 0644 "$tmp/media.py" "$PREFIX/media.py"
+    install -m 0644 "$tmp/pbx.py" "$PREFIX/pbx.py"
     install -m 0644 "$tmp/connectors.py" "$PREFIX/connectors.py"
+    install -m 0755 "$tmp/build_pjsua2.sh" "$PREFIX/build_pjsua2.sh"
+    install -m 0644 "$tmp/requirements.txt" "$PREFIX/requirements.txt"
     mkdir -p "$PREFIX/connectors.d"
     if curl -fsSL "$RAW/$ref/systemd/shorebridge.service" -o "$tmp/svc" 2>/dev/null; then
       install -m 0644 "$tmp/svc" /etc/systemd/system/shorebridge.service; systemctl daemon-reload
@@ -64,6 +110,17 @@ case "$cmd" in
     if systemctl is-active --quiet shorebridge; then echo "now on ${ref:0:12}, restarted."; else
       echo "updated, but service not active - check: shorebridge logs" >&2; fi
     ;;
+  repair)
+    need_root repair
+    [ -f "$PREFIX/build_pjsua2.sh" ] || { echo "shorebridge repair: $PREFIX/build_pjsua2.sh missing; run 'shorebridge update' first" >&2; exit 1; }
+    echo "Rebuilding the virtualenv and pjsua2 (this can take a while) ..."
+    ensure_env "$PREFIX/build_pjsua2.sh" force
+    systemctl daemon-reload
+    systemctl restart shorebridge
+    sleep 1
+    if systemctl is-active --quiet shorebridge; then echo "repaired, restarted."; else
+      echo "repaired, but service not active - check: shorebridge logs" >&2; fi
+    ;;
   logs)     shift; journalctl -u shorebridge "${@:--f}" ;;
   status)   systemctl status shorebridge --no-pager || true ;;
   restart)  need_root restart; systemctl restart shorebridge; echo "restarted." ;;
@@ -71,7 +128,10 @@ case "$cmd" in
   start)    need_root start; systemctl start shorebridge; echo "started." ;;
   config)   need_root config; "${EDITOR:-nano}" "$ETC/config.ini"; echo "run 'shorebridge restart' to apply." ;;
   ui)       echo "http://$(bind_ip || echo localhost):8910" ;;
-  version)  echo "shorebridge $(cat "$PREFIX/.version" 2>/dev/null | cut -c1-12 || echo unknown)" ;;
+  version)
+    echo "shorebridge $(cut -c1-12 "$PREFIX/.version" 2>/dev/null || echo unknown)"
+    echo "pjsua2 $("$VENV/bin/python" -c 'import pjsua2; print(pjsua2.Endpoint().libVersion().full)' 2>/dev/null || echo missing)"
+    ;;
   uninstall)
     need_root uninstall
     purge=false; case "${2:-}" in --purge|--full|--all) purge=true;; esac
@@ -86,7 +146,9 @@ case "$cmd" in
       echo "      factory-reset (Mute + 25327#) to re-trust it."
       rm -f /usr/local/bin/shorebridge
     else
-      rm -f "$PREFIX/shorebridge.py" "$PREFIX/connectors.py"
+      rm -f "$PREFIX/shorebridge.py" "$PREFIX/media.py" "$PREFIX/pbx.py" "$PREFIX/connectors.py" \
+        "$PREFIX/build_pjsua2.sh" "$PREFIX/requirements.txt"
+      rm -rf "$VENV"
       rm -rf "$PREFIX/connectors.d" "$PREFIX/www/fileserver" "$PREFIX/__pycache__"
       echo "Removed the service and program."
       echo "Kept: $ETC (config + phones) and $PREFIX/tls + www/keystore (certs)."
@@ -103,6 +165,8 @@ shorebridge - control CLI
                          fetch code from NAME (default: main), pinned to its newest commit, and restart
   shorebridge logs       follow the service log   (shorebridge logs -n 50 for last 50)
   shorebridge status     systemd service status
+  shorebridge repair     rebuild the virtualenv and pjsua2, then restart
+  shorebridge version    show the installed shorebridge and pjsua2 versions
   shorebridge restart    restart the service
   shorebridge start|stop start / stop the service
   shorebridge config     edit /etc/shorebridge/config.ini

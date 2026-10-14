@@ -5,8 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/shorebridge/shorebridge.py
+ExecStart=/opt/shorebridge/venv/bin/python /opt/shorebridge/shorebridge.py
 Environment=SHOREBRIDGE_CONFIG=/etc/shorebridge/config.ini
+WorkingDirectory=/opt/shorebridge
+KillSignal=SIGTERM
+TimeoutStopSec=10
 Restart=always
 RestartSec=3
 # Needs privileged ports 80 (config server) and 5061/5448 (TLS). Running as root

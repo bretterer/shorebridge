@@ -16,13 +16,23 @@ small web UI on :8910 - point a phone at the bridge, it appears there as "seen",
 assign it an extension + auth, done. The installer only configures the PBX
 connection; per-phone credentials are never in config.ini.
 
-Single process, Python standard library only.
+The PBX side is handled by pjsua2 (see pbx.py): registration, digest auth, call
+signaling, SDP and RTP. The phone side is handcrafted SIP over TLS, and media.py
+bridges the audio between the two.
+
+Single process. Needs the pjsua2 Python module, which the installer builds into a
+venv (/opt/shorebridge/venv).
 """
-import socket, ssl, threading, hashlib, random, time, re, os, sys, json, configparser
+import socket, ssl, threading, hashlib, random, time, re, os, sys, json, configparser, queue, signal
 import http.server, socketserver, functools
 from urllib.parse import parse_qs, urlparse, quote
 from html import escape as html_escape
 import connectors
+try:
+    import media, pbx
+except ImportError as e:
+    sys.stderr.write(f"shorebridge: cannot load the PBX interface ({e}). pjsua2 is missing from this Python "
+                     "environment. Run: sudo shorebridge repair\n"); sys.exit(1)
 
 # ----------------------------- config -----------------------------
 CFG_PATH = os.environ.get("SHOREBRIDGE_CONFIG", "/etc/shorebridge/config.ini")
@@ -61,7 +71,15 @@ CERT = os.path.join(DATA, "tls", "switch_fullchain.crt")
 KEY  = os.path.join(DATA, "tls", "switch.key")
 LOGFILE = CFG.get("bridge", "log_file", fallback=os.path.join(DATA, "shorebridge.log"))
 PHONES_JSON = CFG.get("bridge", "phones_file", fallback=os.path.join(os.path.dirname(CFG_PATH), "phones.json"))
-P3CX = 5062  # our local SIP port toward the PBX
+# Ports. The SIP port is where pjsua2 listens for the PBX. RTP for the phone leg uses 12000-12399
+# and RTP for the PBX leg (also pjsua2) uses 12400-12799.
+SIP_PORT = CFG.getint("pbx", "sip_port", fallback=5062)
+RTP_LOW, RTP_HIGH = 12000, 12400
+PBX_RTP_PORT, PBX_RTP_RANGE = 12400, 400
+# Route requests through the PBX address as an outbound proxy when the registrar domain is not
+# that address (3CX cloud with a local SBC). "auto" works that out, or force it with yes / no.
+_proxy = CFG.get("pbx", "outbound_proxy", fallback="auto").strip().lower()
+USE_PROXY = _proxy in ("1", "true", "yes", "on") or (_proxy == "auto" and (DOMAIN != SBC_IP or SBC_PORT != 5060))
 
 # optional connector: a source of extension data (number/name/auth) from the PBX
 CONN_TYPE = CFG.get("connector", "type", fallback="manual")
@@ -134,156 +152,49 @@ def parse(msg):
     return start, hdrs, body
 def H(hdrs, k):
     v = hdrs.get(k.lower(), []); return v[0] if v else ""
-def allvia(hdrs): return [f"Via: {v}" for v in hdrs.get("via", [])]
-def allrr(hdrs):  return [f"Record-Route: {v}" for v in hdrs.get("record-route", [])]
 def uri_of(val):
     m = re.search(r"<([^>]+)>", val or "")
     return m.group(1) if m else (val.split(";")[0].strip() if val else "")
-def parse_auth(h):
-    g = lambda p: (re.search(p, h).group(1) if re.search(p, h) else None)
-    return g(r'realm="([^"]*)"'), g(r'nonce="([^"]*)"'), g(r'qop="?([a-z,]*)"?'), g(r'opaque="([^"]*)"')
-def digest(method, uri, realm, nonce, qop, cnonce, nc, opaque, authid, password):
-    ha1 = md5(f"{authid}:{realm}:{password}"); ha2 = md5(f"{method}:{uri}")
-    resp = md5(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}") if qop else md5(f"{ha1}:{nonce}:{ha2}")
-    a = f'Digest username="{authid}", realm="{realm}", nonce="{nonce}", uri="{uri}", response="{resp}", algorithm=MD5'
-    if qop: a += f', qop={qop.split(",")[0]}, nc={nc}, cnonce="{cnonce}"'
-    if opaque: a += f', opaque="{opaque}"'
-    return a
 
-# ----------------------------- PBX side (UDP) -----------------------------
-u3 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u3.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-u3.bind((MYIP, P3CX))
-waiters = {}; wlock = threading.Lock()
-def u3_send(msg): u3.sendto(msg.encode(), SBC)
-
-def build_bye(leg):
-    leg["cseq"] = leg.get("cseq", 1) + 1
-    L = [f"BYE {leg['ruri']} SIP/2.0",
-         f"Via: SIP/2.0/{leg['transport']} {MYIP}:{leg['lport']};branch=z9hG4bK{rid(16)};rport"]
-    for rt in leg.get("route", []): L.append(f"Route: {rt}")
-    L += ["Max-Forwards: 70", f"From: {leg['local']};tag={leg['ltag']}", f"To: {leg['remote']}",
-          f"Call-ID: {leg['callid']}", f"CSeq: {leg['cseq']} BYE", "User-Agent: ShoreBridge/1.0", "Content-Length: 0"]
-    data = ("\r\n".join(L) + "\r\n\r\n").encode()
-    if leg["transport"] == "TLS":
-        c = leg.get("conn")
-        if c:
-            try: csend(c, data)
-            except Exception as e: dbg(f"BYE to phone not sent: {e!r}")
-    else:
-        u3.sendto(data, SBC)
-    log(f"sent BYE ({leg['transport']}) callid {leg['callid'][:8]}")
-
-def wait(callid, timeout):
-    end = time.time() + timeout
-    while time.time() < end:
-        with wlock:
-            q = waiters.get(callid)
-            if q:
-                for r in q:
-                    p = r.split("\r\n")[0].split()
-                    if len(p) > 1 and p[1].isdigit() and int(p[1]) >= 200: return r
-        time.sleep(0.05)
-    with wlock:
-        q = waiters.get(callid) or []; return q[-1] if q else None
-
-def reg_loop(ext):
-    last_ok = None
-    while True:
-        # resolve current creds for this extension; exit if the phone was removed
-        creds = None
-        with pstate:
-            for mac, p in PHONES.items():
-                if p["extension"] == ext: creds = (p["auth_id"], p["password"]); break
-        if creds is None:
-            with pstate: reg_threads.pop(ext, None); REGOK.pop(ext, None)
-            log(f"registration for ext {ext} stopped (phone removed)"); return
-        authid, password = creds
-        callid = rid(16) + "@" + MYIP; ftag = rid(8)
-        def mk(cseq, auth=None, hdr="Authorization"):
-            L = [f"REGISTER sip:{DOMAIN} SIP/2.0",
-                 f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch=z9hG4bK{rid(16)};rport", "Max-Forwards: 70",
-                 f"From: <sip:{ext}@{DOMAIN}>;tag={ftag}", f"To: <sip:{ext}@{DOMAIN}>",
-                 f"Call-ID: {callid}", f"CSeq: {cseq} REGISTER",
-                 f"Contact: <sip:{ext}@{MYIP}:{P3CX}>", "Expires: 120", "User-Agent: ShoreBridge/1.0"]
-            if auth: L.append(f"{hdr}: {auth}")
-            L.append("Content-Length: 0"); return "\r\n".join(L) + "\r\n\r\n"
-        with wlock: waiters[callid] = []
-        u3_send(mk(1)); r = wait(callid, 4)
-        if r and (" 401 " in r.split("\r\n")[0] or " 407 " in r.split("\r\n")[0]):
-            st = r.split("\r\n")[0]
-            hh = [l for l in r.split("\r\n") if l.lower().startswith(("www-authenticate", "proxy-authenticate"))]
-            realm, nonce, qop, opaque = parse_auth(hh[0]) if hh else (None,) * 4
-            hdr = "Proxy-Authorization" if " 407 " in st else "Authorization"
-            auth = digest("REGISTER", f"sip:{DOMAIN}", realm, nonce, qop, rid(16), "00000001", opaque, authid, password)
-            with wlock: waiters[callid] = []
-            u3_send(mk(2, auth, hdr)); r = wait(callid, 4)
-        with wlock: waiters.pop(callid, None)
-        ok = bool(r and " 200 " in r.split("\r\n")[0])
-        with pstate: REGOK[ext] = ok
-        dbg(f"ext {ext} registration: " + ("OK" if ok else "FAILED"))
-        if ok != last_ok:
-            # Always log a change, a PBX registration that drops makes every dial fail.
-            if ok: state = "OK"
-            else: state = "FAILED (" + (r.split("\r\n")[0] if r else "no response from the PBX") + ")"
-            log(f"PBX registration for ext {ext} is now {state}")
-            last_ok = ok
-        time.sleep(90 if ok else 15)
-
-def ensure_registrations():
-    with pstate:
-        exts = {p["extension"] for p in PHONES.values()}
-        for ext in exts:
-            if ext not in reg_threads:
-                reg_threads[ext] = True
-                threading.Thread(target=reg_loop, args=(ext,), daemon=True).start()
-                log(f"starting registration for ext {ext}")
-
+# PBX interface. The registrations, calls and audio toward the PBX are handled by
+# pjsua2 (see pbx.py). Here we only react to its events.
+PBX = None
+REG_STATE = {}
 CALLS = {}
 PIN = {}; pinlock = threading.Lock()
 
-def u3_recv():
-    while True:
-        try: data, addr = u3.recvfrom(65535)
-        except Exception: continue
-        try:
-            msg = data.decode("utf-8", "replace"); start = msg.split("\r\n")[0]
-            _, hdrs, _ = parse(msg); cid = H(hdrs, "call-id")
-            _dispatch(start, hdrs, cid, msg, addr)
-        except Exception as e:
-            log("pbx recv err: " + repr(e))
+def pbx_reg_state(ext, ok, detail):
+    # Called by the PBX engine whenever a registration result arrives.
+    with pstate: REGOK[ext] = ok
+    dbg(f"ext {ext} registration: " + ("OK" if ok else "FAILED"))
+    if REG_STATE.get(ext) != ok:
+        # Always log a change, a PBX registration that drops makes every dial fail.
+        REG_STATE[ext] = ok
+        state = "OK" if ok else "FAILED (" + (detail or "no response from the PBX") + ")"
+        log(f"PBX registration for ext {ext} is now {state}")
 
-def _dispatch(start, hdrs, cid, msg, addr):
-    if start.startswith("SIP/2.0"):
-        with wlock:
-            if cid in waiters: waiters[cid].append(msg)
-        for cs in list(CALLS.values()):
-            if cs.x_callid == cid: cs.on_3cx_response(msg)
-    else:
-        method = start.split()[0]
-        if method == "OPTIONS":
-            u3_send(resp_line(200, "OK", hdrs))
-        elif method == "INVITE":
-            threading.Thread(target=inbound_invite, args=(hdrs, msg, addr), daemon=True).start()
-        elif method in ("BYE", "CANCEL", "ACK"):
-            for cs in list(CALLS.values()):
-                if cs.x_callid == cid: cs.on_3cx_request(method, hdrs, msg)
-            if method != "ACK": u3.sendto(resp_line(200, "OK", hdrs).encode(), addr)
+def ensure_registrations():
+    # Register every assigned extension with the PBX and drop the ones that are gone.
+    with pstate:
+        wanted = {str(p["extension"]).strip(): (p["auth_id"], p["password"]) for p in PHONES.values()}
+        for ext in [e for e in REGOK if e not in wanted]:
+            REGOK.pop(ext, None); REG_STATE.pop(ext, None)
+    if PBX: PBX.sync_accounts(wanted)
 
-def resp_line(code, reason, hdrs):
-    L = [f"SIP/2.0 {code} {reason}"] + allvia(hdrs) + allrr(hdrs) + [
-        f"From: {H(hdrs,'from')}", f"To: {H(hdrs,'to')}",
-        f"Call-ID: {H(hdrs,'call-id')}", f"CSeq: {H(hdrs,'cseq')}", "Content-Length: 0"]
-    return "\r\n".join(L) + "\r\n\r\n"
+def pbx_incoming(handle):
+    # Runs on the PBX engine thread, so hand the call to a thread of its own.
+    threading.Thread(target=inbound_call, args=(handle,), daemon=True).start()
 
-# ----------------------------- RTP relay -----------------------------
-def alloc_rtp():
-    # Do not set SO_REUSEADDR here. On Linux it lets two UDP sockets share one
-    # port, which made the phone leg and the PBX leg of a call collide.
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    for p in range(12000, 12800, 2):
-        try: s.bind((MYIP, p)); return s, p
-        except OSError: continue
-    s.bind((MYIP, 0)); return s, s.getsockname()[1]
+def build_bye(leg):
+    # BYE for an answered call, sent to the phone over its TLS connection.
+    leg["cseq"] = leg.get("cseq", 1) + 1
+    L = [f"BYE {leg['ruri']} SIP/2.0",
+         f"Via: SIP/2.0/TLS {MYIP}:{leg['lport']};branch=z9hG4bK{rid(16)};rport"]
+    L += ["Max-Forwards: 70", f"From: {leg['local']};tag={leg['ltag']}", f"To: {leg['remote']}",
+          f"Call-ID: {leg['callid']}", f"CSeq: {leg['cseq']} BYE", "User-Agent: ShoreBridge/1.0", "Content-Length: 0"]
+    try: csend(leg["conn"], ("\r\n".join(L) + "\r\n\r\n").encode())
+    except Exception as e: dbg(f"BYE to phone not sent: {e!r}")
+    log(f"Sent BYE (TLS) callid {leg['callid'][:8]}")
 
 def sdp_media(sdp):
     ip = port = None
@@ -299,51 +210,32 @@ def sdp_telephone_event(sdp):
         if m: return int(m.group(1))
     return None
 
-def translate_rtp_payload(data, source_pt, target_pt):
-    if source_pt is None or target_pt is None or source_pt == target_pt or len(data) < 2:
-        return data
-    if (data[1] & 0x7f) != source_pt:
-        return data
-    return data[:1] + bytes([(data[1] & 0x80) | target_pt]) + data[2:]
+def phone_sdp(cs, savp=False):
+    # The SDP we give the phone: plain PCMU on the port of the phone leg.
+    sdp = ("v=0\r\n" f"o=switch 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
+           f"m=audio {cs.leg.port} RTP/AVP 0 102\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:102 telephone-event/8000\r\n"
+           "a=ptime:20\r\n" "a=sendrecv\r\n")
+    return sdp + ("m=audio 0 RTP/SAVP 0\r\n" if savp else "")
 
 class CallSession:
-    def __init__(s, dst, conn, mac, ext, authid, password):
-        s.dst = dst; s.pc = conn; s.mac = mac
-        s.ext = ext; s.authid = authid; s.password = password
-        s.x_callid = rid(16) + "@" + MYIP; s.x_ftag = rid(8); s.x_totag = None
-        s.p_callid = None; s.ph = None
-        s.sockP, s.rpP = alloc_rtp(); s.sock3, s.rp3 = alloc_rtp()
-        s.phone_rtp = None; s.x_rtp = None
-        s.phone_dtmf_pt = None; s.x_dtmf_pt = None
-        s.alive = True; s.p_ftag = None; s.p_totag = None; s.p_addr = None
-        s.p_dialog = None; s.x_dialog = None; s.p_inv = None
-    def on_3cx_response(s, msg): pass
-    def on_3cx_request(s, method, hdrs, msg):
-        if method in ("BYE", "CANCEL"): s.teardown(origin="3cx")
-    def relay(s):
-        import select as sel
-        try: s.sockP.setblocking(False); s.sock3.setblocking(False)
-        except Exception: return
-        np_ = n3 = 0
+    # One call, bridged between the phone (handcrafted SIP) and the PBX (pjsua2).
+    def __init__(s, dst, conn, mac, ext):
+        s.dst = dst; s.pc = conn; s.mac = mac; s.ext = ext
+        s.p_callid = None; s.ph = None; s.p_addr = None
+        s.p_ftag = None; s.p_totag = None
+        s.p_dialog = None; s.p_inv = None
+        s.leg = media.PhoneRtpLeg.open(MYIP, RTP_LOW, RTP_HIGH, log, dbg)
+        s.pbx = None                        # pbx.CallHandle for the PBX leg
+        s.alive = True
+    def send_dtmf_to_pbx(s, digit):
+        if s.pbx: s.pbx.send_dtmf(digit)
+    def pump(s):
+        # Runs for the life of an answered call and reacts to what the PBX does.
         while s.alive:
-            try: r, _, _ = sel.select([s.sockP, s.sock3], [], [], 0.5)
-            except Exception: break
-            for so in r:
-                try: d, a = so.recvfrom(4096)
-                except Exception: continue
-                if so is s.sockP:
-                    s.phone_rtp = a; np_ += 1
-                    if s.x_rtp:
-                        d = translate_rtp_payload(d, s.phone_dtmf_pt, s.x_dtmf_pt)
-                        try: s.sock3.sendto(d, s.x_rtp)
-                        except Exception: pass
-                else:
-                    s.x_rtp = a; n3 += 1
-                    if s.phone_rtp:
-                        d = translate_rtp_payload(d, s.x_dtmf_pt, s.phone_dtmf_pt)
-                        try: s.sockP.sendto(d, s.phone_rtp)
-                        except Exception: pass
-                if np_ in (1, 250) or n3 in (1, 250): dbg(f"relay: phone->{np_} pbx->{n3}")
+            try: ev = s.pbx.events.get(timeout=0.5)
+            except queue.Empty: continue
+            if ev[0] == "dtmf": s.leg.send_dtmf(ev[1])
+            elif ev[0] == "ended": s.teardown(origin="pbx"); return
     def teardown(s, origin=None):
         if not s.alive: return
         s.alive = False
@@ -361,75 +253,11 @@ class CallSession:
                     csend(iv["conn"], ("\r\n".join(L) + "\r\n\r\n").encode())
                     log("sent CANCEL to phone (caller hung up before answer)")
                 except Exception as e: log("cancel phone err " + repr(e))
-        if origin != "3cx" and s.x_dialog:
-            try: build_bye(s.x_dialog)
-            except Exception as e: log("bye pbx err " + repr(e))
-        for so in (s.sockP, s.sock3):
-            try: so.close()
-            except Exception: pass
-        CALLS.pop(s.p_callid, None); CALLS.pop(s.x_callid, None)
-        log(f"call {s.dst} ended (origin={origin})")
-
-# ----------------------------- outbound: phone -> PBX -----------------------------
-def x_invite(cs):
-    sdp = ("v=0\r\n" f"o=bridge 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
-           f"m=audio {cs.rp3} RTP/AVP 0 101\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:101 telephone-event/8000\r\n" "a=sendrecv\r\n")
-    def mk(cseq, branch, auth=None, hdr="Proxy-Authorization"):
-        b = sdp.encode()
-        L = [f"INVITE sip:{cs.dst}@{DOMAIN} SIP/2.0",
-             f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch={branch};rport", "Max-Forwards: 70",
-             f"From: <sip:{cs.ext}@{DOMAIN}>;tag={cs.x_ftag}", f"To: <sip:{cs.dst}@{DOMAIN}>",
-             f"Call-ID: {cs.x_callid}", f"CSeq: {cseq} INVITE",
-             f"Contact: <sip:{cs.ext}@{MYIP}:{P3CX}>", "User-Agent: ShoreBridge/1.0",
-             "Content-Type: application/sdp", f"Content-Length: {len(b)}"]
-        if auth: L.insert(8, f"{hdr}: {auth}")
-        return ("\r\n".join(L) + "\r\n\r\n").encode() + b
-    b1 = "z9hG4bK" + rid(16)
-    with wlock: waiters[cs.x_callid] = []
-    u3.sendto(mk(1, b1), SBC)
-    r = wait_invite(cs.x_callid, 6, cseq=1)
-    if r and (" 407 " in r.split("\r\n")[0] or " 401 " in r.split("\r\n")[0]):
-        st = r.split("\r\n")[0]
-        hh = [l for l in r.split("\r\n") if l.lower().startswith(("www-authenticate", "proxy-authenticate"))]
-        realm, nonce, qop, opaque = parse_auth(hh[0]); _, h407, _ = parse(r)
-        ack = [f"ACK sip:{cs.dst}@{DOMAIN} SIP/2.0", f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch={b1}",
-               "Max-Forwards: 70", f"From: <sip:{cs.ext}@{DOMAIN}>;tag={cs.x_ftag}", f"To: {H(h407,'to')}",
-               f"Call-ID: {cs.x_callid}", "CSeq: 1 ACK", "Content-Length: 0"]
-        u3.sendto(("\r\n".join(ack) + "\r\n\r\n").encode(), SBC)
-        hdr = "Proxy-Authorization" if " 407 " in st else "Authorization"
-        auth = digest("INVITE", f"sip:{cs.dst}@{DOMAIN}", realm, nonce, qop, rid(16), "00000001", opaque, cs.authid, cs.password)
-        b2 = "z9hG4bK" + rid(16)
-        with wlock: waiters[cs.x_callid] = []
-        u3.sendto(mk(2, b2, auth, hdr), SBC)
-        r = wait_invite(cs.x_callid, 35, cseq=2, cs=cs)
-    return r
-
-def wait_invite(callid, timeout, cseq=None, cs=None):
-    end = time.time() + timeout; last = None; rang = False
-    while time.time() < end:
-        with wlock: q = list(waiters.get(callid, []))
-        for m in q:
-            _, h, _ = parse(m)
-            if cseq is not None and not H(h, "cseq").strip().startswith(f"{cseq} "): continue
-            code = int(m.split("\r\n")[0].split()[1])
-            if code >= 200: return m
-            if code in (180, 183) and cs is not None and not rang:
-                rang = True
-                try: csend(cs.pc, p_resp(180, "Ringing", cs.ph, cs.p_addr, "INVITE"))
-                except Exception as e: dbg(f"Ringing to phone not sent: {e!r}")
-            last = m
-        time.sleep(0.05)
-    return last
-
-def x_ack_ok(resp, cs):
-    _, h, _ = parse(resp); to = H(h, "to")
-    ruri = uri_of(H(h, "contact")) or f"sip:{cs.dst}@{DOMAIN}"
-    L = [f"ACK {ruri} SIP/2.0", f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch=z9hG4bK{rid(16)};rport"]
-    for rt in reversed(h.get("record-route", [])): L.append(f"Route: {rt}")
-    L += ["Max-Forwards: 70", f"From: <sip:{cs.ext}@{DOMAIN}>;tag={cs.x_ftag}", f"To: {to}",
-          f"Call-ID: {cs.x_callid}", "CSeq: 2 ACK", "Content-Length: 0"]
-    u3.sendto(("\r\n".join(L) + "\r\n\r\n").encode(), SBC)
-
+        if origin != "pbx" and s.pbx:
+            s.pbx.hangup()                      # BYE, CANCEL or a rejection, whatever fits the state
+        s.leg.stop()
+        CALLS.pop(s.p_callid, None)
+        log(f"Call {s.dst} ended (origin={origin})")
 # ----------------------------- phone side: TLS 5061 + CAS 5448 -----------------------------
 def tlsctx():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(CERT, KEY)
@@ -524,37 +352,40 @@ def phone_invite(conn, mac, hdrs, body, addr):
         log(f"Refusing dial to {dst} with 403: phone {mac or 'unidentified'} at {addr[0]} has no extension "
             f"assigned (assigned phones: {sorted(PHONES)}, last known IPs: {dict(PHONE_IPS)})")
         phone_send(conn, p_resp(403, "Forbidden", hdrs, addr, "INVITE")); return
-    ext, authid, password = creds
-    log(f"phone {mac} (ext {ext}) dialed {dst}")
+    ext = creds[0]
+    log(f"Phone {mac} (ext {ext}) dialed {dst}")
     dbg(f"Dial from {mac}: ext {ext} pbx_registered={REGOK.get(ext)} conn_in_table={CONNS.get(mac) is conn}")
-    cs = CallSession(dst, conn, mac, ext, authid, password)
-    cs.p_callid = H(hdrs, "call-id"); cs.ph = hdrs; cs.p_addr = addr; cs.phone_rtp = sdp_media(body)
-    cs.phone_dtmf_pt = sdp_telephone_event(body)
-    CALLS[cs.p_callid] = cs; CALLS[cs.x_callid] = cs
+    cs = CallSession(dst, conn, mac, ext)
+    cs.p_callid = H(hdrs, "call-id"); cs.ph = hdrs; cs.p_addr = addr
+    CALLS[cs.p_callid] = cs
     if not phone_send(conn, p_resp(100, "Trying", hdrs, addr, "INVITE")):
         cs.teardown(); return
-    r = x_invite(cs)
-    if not r:
+    cs.leg.start(sdp_media(body), sdp_telephone_event(body), cs.send_dtmf_to_pbx)
+    cs.pbx = PBX.make_call(ext, dst, cs.leg)
+    rang = False; final = None; end = time.time() + 45
+    while cs.alive and time.time() < end:
+        try: ev = cs.pbx.events.get(timeout=0.5)
+        except queue.Empty: continue
+        if ev[0] == "early" and not rang:
+            rang = True
+            phone_send(conn, p_resp(180, "Ringing", hdrs, addr, "INVITE"))
+        elif ev[0] in ("answered", "ended"):
+            final = ev; break
+    if not cs.alive: return             # the phone gave up (CANCEL) while we were waiting
+    if final is None:
         log("PBX no answer"); phone_send(conn, p_resp(504, "Server Timeout", hdrs, addr, "INVITE")); cs.teardown(); return
-    code = int(r.split("\r\n")[0].split()[1])
-    if code >= 300:
-        log(f"PBX rejected: {r.splitlines()[0]}")
-        phone_send(conn, p_resp(code if code < 700 else 486, "Declined", hdrs, addr, "INVITE")); cs.teardown(); return
-    _, xh, xb = parse(r); cs.x_rtp = sdp_media(xb); cs.x_dtmf_pt = sdp_telephone_event(xb); cs.x_totag = H(xh, "to"); x_ack_ok(r, cs)
-    cs.x_dialog = {'ruri': uri_of(H(xh, "contact")) or f"sip:{dst}@{DOMAIN}", 'transport': 'UDP', 'lport': P3CX,
-                   'local': f"<sip:{ext}@{DOMAIN}>", 'ltag': cs.x_ftag, 'remote': H(xh, "to"),
-                   'callid': cs.x_callid, 'route': list(reversed(xh.get("record-route", []))), 'cseq': 2}
+    if final[0] == "ended":
+        code = final[1]
+        log(f"PBX rejected: {code} {final[2]}")
+        phone_send(conn, p_resp(code if 300 <= code < 700 else 486, "Declined", hdrs, addr, "INVITE")); cs.teardown(); return
     cs.p_dialog = {'ruri': uri_of(H(hdrs, "contact")) or f"sips:anonymous@{addr[0]}:5061", 'transport': 'TLS', 'lport': 5061,
                    'local': H(hdrs, "to"), 'ltag': mktag(cs.p_callid + "srv"), 'remote': H(hdrs, "from"),
                    'callid': cs.p_callid, 'route': [], 'cseq': 1, 'conn': conn}
-    threading.Thread(target=cs.relay, daemon=True).start()
-    ans = ("v=0\r\n" f"o=switch 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
-           f"m=audio {cs.rpP} RTP/AVP 0 102\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:102 telephone-event/8000\r\n" "a=ptime:20\r\n" "a=sendrecv\r\n"
-           "m=audio 0 RTP/SAVP 0\r\n")
-    if not phone_send(conn, p_resp(200, "OK", hdrs, addr, "INVITE", sdp=ans)):
+    cs.leg.activate()
+    if not phone_send(conn, p_resp(200, "OK", hdrs, addr, "INVITE", sdp=phone_sdp(cs, savp=True))):
         cs.teardown(); return
-    log(f"call up: ext {ext} <-> {dst}")
-
+    log(f"Call up: ext {ext} <-> {dst}")
+    cs.pump()
 def register_phone(conn, hdrs, addr):
     """Handle a phone REGISTER: identify by MAC, attach its connection; unknown MACs go to SEEN for the UI."""
     mac = mac_from_contact(H(hdrs, "contact")) or ("ip-" + addr[0].replace(".", "-"))
@@ -672,6 +503,13 @@ def phone_handle(conn, addr):
                 cs = CALLS.get(H(hdrs, "call-id"))
                 csend(conn, p_resp(200, "OK", hdrs, addr, method))
                 if cs: cs.teardown(origin="phone")
+            elif method == "CANCEL":
+                # The phone gave up on an outbound call that the PBX had not answered yet.
+                cs = CALLS.get(H(hdrs, "call-id"))
+                csend(conn, p_resp(200, "OK", hdrs, addr, method))
+                if cs and cs.ph is not None and cs.p_dialog is None:
+                    phone_send(conn, p_resp(487, "Request Terminated", cs.ph, cs.p_addr, "INVITE"))
+                    cs.teardown(origin="phone")
             else:
                 csend(conn, p_resp(200, "OK", hdrs, addr, method))
     except Exception as e:
@@ -986,27 +824,27 @@ def tls_server(port, handler):
         except Exception as e:
             log(f"TLS :{port} accept error: {e!r}"); time.sleep(0.2)
 
-# ----------------------------- inbound: PBX -> phone -----------------------------
-def inbound_invite(xh, xraw, xaddr):
-    _, _, xbody = parse(xraw)
-    to = H(xh, "to"); m = re.search(r'sips?:([^@>;]+)@', uri_of(to) or to)
-    ext = m.group(1) if m else ""
+def inbound_call(h):
+    try:
+        inbound_invite(h)
+    except Exception as e:
+        log(f"Inbound call error: {e!r}")
+        h.hangup()
+
+def inbound_invite(h):
+    ext, caller = h.ext, h.caller
     mac = mac_for_ext(ext)
     conn = CONNS.get(mac) if mac else None
     if not conn:
-        log(f"inbound for ext {ext}: no phone online"); u3.sendto(resp_line(480, "Unavailable", xh).encode(), xaddr); return
-    fm = re.search(r'sips?:([^@>;]+)', H(xh, "from")); caller = fm.group(1) if fm else "unknown"
-    cs = CallSession("inbound", conn, mac, ext, "", "")
-    cs.x_callid = H(xh, "call-id"); cs.x_rtp = sdp_media(xbody)
+        log(f"Inbound for ext {ext}: no phone online"); h.reject(480); return
+    cs = CallSession("inbound", conn, mac, ext)
+    cs.pbx = h; h.set_leg(cs.leg)
     cs.p_callid = rid(16) + "@" + MYIP; cs.p_ftag = rid(8)
-    CALLS[cs.x_callid] = cs; CALLS[cs.p_callid] = cs
+    CALLS[cs.p_callid] = cs
     with pstate:
         contact = CONTACTS.get(mac)
     phone_uri = contact or f"sips:anonymous@{xaddr_ip(conn)}:5061"
-    u3.sendto(resp_line(100, "Trying", xh).encode(), xaddr)
-    sdp = ("v=0\r\n" f"o=switch 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
-           f"m=audio {cs.rpP} RTP/AVP 0 102\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:102 telephone-event/8000\r\n" "a=ptime:20\r\n" "a=sendrecv\r\n")
-    b = sdp.encode(); pbranch = "z9hG4bK" + rid(16)
+    b = phone_sdp(cs).encode(); pbranch = "z9hG4bK" + rid(16)
     cs.p_inv = {"branch": pbranch, "contact": phone_uri,
                 "from": f"<sips:{caller}@{MYIP}>;tag={cs.p_ftag}", "callid": cs.p_callid, "conn": conn}
     inv = ("\r\n".join([
@@ -1017,11 +855,11 @@ def inbound_invite(xh, xraw, xaddr):
         f"Contact: <sips:switch@{MYIP}:5061;transport=tls>", "User-Agent: ShoreBridge/1.0",
         "Content-Type: application/sdp", f"Content-Length: {len(b)}"]) + "\r\n\r\n").encode() + b
     with pinlock: PIN[cs.p_callid] = []
-    log(f"inbound from {caller} -> ext {ext} (ringing phone {mac})")
+    log(f"Inbound from {caller} -> ext {ext} (ringing phone {mac})")
     try: csend(conn, inv)
     except Exception as e:
         log(f"Could not deliver inbound call to phone {mac}: {e!r}")
-        u3.sendto(resp_line(480, "Unavailable", xh).encode(), xaddr); cs.teardown(); return
+        h.reject(480); cs.teardown(); return
     if CSTA_AUTOANSWER:   # test mode: fire AnswerCall ~3s into the ring to prove it answers
         def _autoanswer():
             time.sleep(3)
@@ -1031,43 +869,40 @@ def inbound_invite(xh, xraw, xaddr):
         threading.Thread(target=_autoanswer, daemon=True).start()
     got_ring = False; end = time.time() + 45; final = None
     while time.time() < end and cs.alive:
+        try: ev = h.events.get_nowait()
+        except queue.Empty: ev = None
+        if ev and ev[0] == "ended":         # the caller hung up before the phone answered
+            cs.teardown(origin="pbx"); return
         with pinlock: q = list(PIN.get(cs.p_callid, []))
         for r in q:
             code = int(r.split("\r\n")[0].split()[1])
             if code in (180, 183) and not got_ring:
-                got_ring = True; u3.sendto(resp_line(180, "Ringing", xh).encode(), xaddr)
+                got_ring = True; h.ring()
             if code >= 200: final = r
         if final: break
         time.sleep(0.1)
+    with pinlock: PIN.pop(cs.p_callid, None)
     if not cs.alive: return
     if not final:
-        u3.sendto(resp_line(487, "Request Terminated", xh).encode(), xaddr); cs.teardown(); return
+        h.reject(487); cs.teardown(); return
     code = int(final.split("\r\n")[0].split()[1])
     if code >= 300:
-        u3.sendto(resp_line(486, "Busy Here", xh).encode(), xaddr); cs.teardown(); return
-    _, ph, pb = parse(final); cs.phone_rtp = sdp_media(pb); cs.phone_dtmf_pt = sdp_telephone_event(pb); cs.p_totag = H(ph, "to")
+        h.reject(486); cs.teardown(); return
+    _, ph, pb = parse(final); cs.p_totag = H(ph, "to")
+    cs.leg.start(sdp_media(pb), sdp_telephone_event(pb), cs.send_dtmf_to_pbx)
     ack = ("\r\n".join([
         f"ACK {phone_uri} SIP/2.0", f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)}",
         "Max-Forwards: 70", f"From: <sips:{caller}@{MYIP}>;tag={cs.p_ftag}", f"To: {cs.p_totag}",
         f"Call-ID: {cs.p_callid}", "CSeq: 1 ACK", "Content-Length: 0"]) + "\r\n\r\n").encode()
     try: csend(conn, ack)
     except Exception as e: log(f"Could not send ACK to phone {mac}: {e!r}")
-    threading.Thread(target=cs.relay, daemon=True).start()
-    osdp = ("v=0\r\n" f"o=bridge 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
-            f"m=audio {cs.rp3} RTP/AVP 0 101\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:101 telephone-event/8000\r\n" "a=sendrecv\r\n")
-    ob = osdp.encode(); to2 = H(xh, "to")
-    if ";tag=" not in to2: to2 = to2 + ";tag=" + mktag(cs.x_callid + "in")
-    L = [f"SIP/2.0 200 OK"] + allvia(xh) + allrr(xh) + [f"From: {H(xh,'from')}", f"To: {to2}",
-         f"Call-ID: {cs.x_callid}", f"CSeq: {H(xh,'cseq')}",
-         f"Contact: <sip:{ext}@{MYIP}:{P3CX}>", "Content-Type: application/sdp", f"Content-Length: {len(ob)}"]
-    u3.sendto(("\r\n".join(L) + "\r\n\r\n").encode() + ob, xaddr)
-    cs.x_dialog = {'ruri': uri_of(H(xh, "contact")) or uri_of(H(xh, "from")), 'transport': 'UDP', 'lport': P3CX,
-                   'local': H(xh, "to"), 'ltag': mktag(cs.x_callid + "in"), 'remote': H(xh, "from"),
-                   'callid': cs.x_callid, 'route': list(reversed(xh.get("record-route", []))), 'cseq': 1}
     cs.p_dialog = {'ruri': phone_uri, 'transport': 'TLS', 'lport': 5061,
                    'local': f"<sips:{caller}@{MYIP}>", 'ltag': cs.p_ftag, 'remote': cs.p_totag,
                    'callid': cs.p_callid, 'route': [], 'cseq': 1, 'conn': conn}
-    log(f"inbound call up: {caller} <-> ext {ext}")
+    cs.leg.activate()
+    h.answer()
+    log(f"Inbound call up: {caller} <-> ext {ext}")
+    cs.pump()
 
 def xaddr_ip(conn):
     try: return conn.getpeername()[0]
@@ -1420,7 +1255,7 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/delete":
             mac = norm_mac(f.get("mac", ""))
             with pstate: PHONES.pop(mac, None)
-            save_phones(); write_phoneconfig(); log(f"UI: removed phone {mac}")
+            save_phones(); ensure_registrations(); write_phoneconfig(); log(f"UI: removed phone {mac}")
         elif path == "/dir-add":
             name = f.get("name", "").strip(); number = f.get("number", "").strip()
             typ = f.get("type", "mobile").strip() or "mobile"
@@ -1474,12 +1309,22 @@ def main():
         if not os.path.exists(p):
             sys.stderr.write(f"shorebridge: missing {p} (run the installer first)\n"); sys.exit(1)
     load_phones()
-    log(f"shorebridge starting: bind={MYIP} pbx={SBC_IP}:{SBC_PORT} domain={DOMAIN} phones={len(PHONES)}")
+    log(f"shorebridge starting: bind={MYIP} pbx={SBC_IP}:{SBC_PORT} domain={DOMAIN} phones={len(PHONES)} proxy={USE_PROXY}")
+    global PBX
+    PBX = pbx.PbxEngine(bind_ip=MYIP, domain=DOMAIN, pbx_ip=SBC_IP, pbx_port=SBC_PORT, sip_port=SIP_PORT,
+                        rtp_port=PBX_RTP_PORT, rtp_range=PBX_RTP_RANGE, use_proxy=USE_PROXY, debug=DEBUG,
+                        log=log, on_reg_state=pbx_reg_state, on_incoming=pbx_incoming)
+    try: PBX.start()
+    except pbx.PbxError as e:
+        log(f"Could not start the PBX interface: {e}"); sys.exit(1)
+    def _stop(signum, frame):
+        # Hang up calls and unregister from the PBX before exiting.
+        log("Shutting down"); PBX.stop(); os._exit(0)
+    signal.signal(signal.SIGTERM, _stop); signal.signal(signal.SIGINT, _stop)
     ensure_registrations()
     threading.Thread(target=refresh_catalog, daemon=True).start()
     threading.Thread(target=http_server, daemon=True).start()
     threading.Thread(target=admin_server, daemon=True).start()
-    threading.Thread(target=u3_recv, daemon=True).start()
     threading.Thread(target=tls_server, args=(5061, phone_handle), daemon=True).start()
     threading.Thread(target=tls_server, args=(5448, cas_handle), daemon=True).start()
     if DEBUG: threading.Thread(target=status_loop, daemon=True).start()

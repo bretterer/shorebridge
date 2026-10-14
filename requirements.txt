@@ -1,0 +1,5 @@
+# Python packages installed into /opt/shorebridge/venv by the installer.
+#
+# shorebridge itself only needs the standard library. The PBX side needs pjsua2,
+# which is not on PyPI and is compiled from the pjproject sources by
+# build_pjsua2.sh, so it is not listed here.

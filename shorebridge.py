@@ -275,6 +275,129 @@ def sdp_media(sdp):
         if line.startswith("m=audio") and port is None: port = int(line.split()[1])
     return (ip, port) if ip and port else None
 
+# ----------------------------- call log (for the phone's History) -----------------------------
+HISTORY_FMT_JSON = os.path.join(DATA, "history_format.json")
+CALLLOG_LOCK = threading.Lock()
+CALLLOG_MAX = 200
+
+def load_calllog():
+    try:
+        with open(CALLS_JSON) as f: d = json.load(f); return d if isinstance(d, list) else []
+    except Exception: return []
+
+def _digits(n): return re.sub(r"\D", "", str(n or ""))[-10:]
+def name_for_number(num):
+    """Best-effort caller name from the directory / configured phones (last 10 digits)."""
+    key = _digits(num)
+    if not key: return ""
+    for e in load_directory():
+        if _digits(e.get("number")) == key: return e.get("name", "")
+    for p in PHONES.values():
+        if _digits(p.get("extension")) == key: return p.get("label", "")
+    return ""
+
+def delete_calllog(ext, ids=None):
+    """Remove this extension's records: all of them (ids=None) or just those ids.
+    Other phones' records are never touched. Returns the number removed."""
+    if not ext: return 0                        # unidentified phone: never delete
+    with CALLLOG_LOCK:
+        log_ = load_calllog()
+        keep = [r for r in log_ if (ext and r.get("ext") != ext)
+                or (ids is not None and r.get("id") not in ids)]
+        removed = len(log_) - len(keep)
+        if removed:
+            # remember the highest id ever issued before dropping records, so it is never reused
+            seq_f = CALLS_JSON + ".seq"
+            try: last = int(open(seq_f).read().strip() or 0)
+            except Exception: last = 0
+            hi = max([last] + [r.get("id", 0) for r in log_])
+            with open(seq_f, "w") as f: f.write(str(hi))
+            tmp = CALLS_JSON + ".tmp"
+            with open(tmp, "w") as f: json.dump(keep, f, indent=1)
+            os.replace(tmp, CALLS_JSON)
+    return removed
+
+def record_call(cs):
+    try:
+        peer = getattr(cs, "peer", "") or cs.dst
+        start = getattr(cs, "t_start", None) or time.time(); up = getattr(cs, "t_up", None)
+        direction = getattr(cs, "direction", "out")
+        rec = {"ext": cs.ext, "mac": cs.mac, "direction": direction, "number": peer,
+               "name": name_for_number(peer), "start": int(start),
+               "duration": int(time.time() - up) if up else 0,
+               "answered": bool(up), "missed": direction == "in" and not up}
+        with CALLLOG_LOCK:
+            log_ = load_calllog()
+            # ids are never reused (the phone caches recids): keep a high-water mark
+            seq_f = CALLS_JSON + ".seq"
+            try: last = int(open(seq_f).read().strip() or 0)
+            except Exception: last = 0
+            rec["id"] = max(last, max((r.get("id", 0) for r in log_), default=0)) + 1
+            with open(seq_f, "w") as f: f.write(str(rec["id"]))
+            log_.append(rec); log_ = log_[-CALLLOG_MAX:]
+            tmp = CALLS_JSON + ".tmp"
+            with open(tmp, "w") as f: json.dump(log_, f, indent=1)
+            os.replace(tmp, CALLS_JSON)
+        log(f"call log: #{rec['id']} {direction} {peer} {'missed' if rec['missed'] else str(rec['duration'])+'s'}")
+    except Exception as e:
+        log("call log err " + repr(e))
+
+# History reply format, from the IP485g firmware (bin/linemgrSip, CasCallLogsParser):
+# reply keys request-id/response/details/message + "records"; records use the same
+# COLUMNAR layout as the directory: element[0] = header (field names), then rows.
+# Record fields: recid rec-type ts-start duration-secs time-label secure
+# call-recording-flag parties; each party list is columnar too: name number
+# number-canonical. The numeric rec-type codes are NOT in the binary as text, so
+# they (and the ts-start unit) are read from history_format.json on every request.
+HIST_HDR  = ["recid", "rec-type", "ts-start", "duration-secs", "time-label", "secure",
+             "call-recording-flag", "parties"]
+HISTORY_FMT_DEFAULT = {"rec_type": {"in": 1, "out": 2, "missed": 3}, "ts_units": "s", "time_label": 0}
+
+def _canon(num):
+    d = re.sub(r"\D", "", str(num or ""))
+    if len(d) == 10: return "+1" + d
+    if len(d) == 11 and d.startswith("1"): return "+" + d
+    return str(num or "")
+
+def cas_history_response(req, ext, sid=""):
+    try:
+        with open(HISTORY_FMT_JSON) as f: fmt = {**HISTORY_FMT_DEFAULT, **json.load(f)}
+    except Exception: fmt = HISTORY_FMT_DEFAULT
+    msg = req.get("message"); rid_ = req.get("request-id", 0)
+    base = {"request-id": rid_, "topic": "history", "message": msg, "response": 0}
+    if msg in ("delete-recs", "delete-all"):
+        log(f"CAS history {msg} request: {json.dumps(req)[:300]}")
+        ids = req.get("recids", req.get("recid", []))
+        if not isinstance(ids, list): ids = [ids]
+        ids = {int(x) for x in ids if str(x).lstrip("-").isdigit()}
+        n = delete_calllog(ext, None if msg == "delete-all" else ids)
+        log(f"CAS history {msg} -> removed {n} rec(s) for ext {ext}")
+        return base
+    if msg not in ("get-recs", "get-page-view"):
+        log(f"CAS history {msg} -> ok"); return base          # close-page-view etc.
+    recs = [r for r in load_calllog() if not ext or r.get("ext") == ext]
+    # newest first, except get-recs forward=true (asks for the oldest end)
+    recs.sort(key=lambda r: r.get("start", 0), reverse=not (msg == "get-recs" and req.get("forward")))
+    try: mx = int(req.get("max", req.get("count", 50)))   # get-page-view uses "count"
+    except Exception: mx = 50
+    rt = fmt.get("rec_type", HISTORY_FMT_DEFAULT["rec_type"])
+    mult = 1000 if fmt.get("ts_units") == "ms" else 1
+    rows = [HIST_HDR]
+    for r in recs[:max(0, mx)]:
+        kind = "missed" if r.get("missed") else ("in" if r.get("direction") == "in" else "out")
+        name = r.get("name") or ""
+        parties = [PARTY_HDR, [name, str(r.get("number", "")), _canon(r.get("number"))]]
+        rows.append([r.get("id", 0), rt.get(kind, 0), int(r.get("start", 0)) * mult,
+                     int(r.get("duration", 0)), fmt.get("time_label", 0), False, False, parties])
+    resp = {**base, "records": rows}
+    log(f"CAS history {msg} max={req.get('max')} count={req.get('count')} forward={req.get('forward')} -> {len(rows)-1} rec(s)")
+    if DEBUG: dbg("CAS history reply: " + json.dumps(resp)[:800])
+    return resp
+
+# ---- in-dialog re-INVITE (hold / resume / session-timer refresh) ----
+# Both legs are answered locally by the bridge: the RTP relay keeps running, we just
+# mirror the offered direction so each side sees a valid answer. Without this a
+# re-INVITE was treated as a brand-new call (Hold dropped the phone's call leg).
 class CallSession:
     def __init__(s, dst, conn, mac, ext, authid, password):
         s.dst = dst; s.pc = conn; s.mac = mac
@@ -335,6 +458,7 @@ class CallSession:
             except Exception: pass
         CALLS.pop(s.p_callid, None); CALLS.pop(s.x_callid, None)
         log(f"call {s.dst} ended (origin={origin})")
+        record_call(s)
 
 # ----------------------------- outbound: phone -> PBX -----------------------------
 def x_invite(cs):
@@ -692,11 +816,24 @@ def cas_dispatch(method, target, body, client_ip=""):
             return UNAUTH
         try: req = json.loads(body or "{}")
         except Exception: req = {}
+        # The phone batches requests as a JSON array (e.g. two history get-recs after a
+        # call). Answer each one and return an array. Previously this crashed the
+        # handler, the phone got no reply and fell into a re-login loop.
+        if isinstance(req, list):
+            return [cas_dispatch(method, target, json.dumps(x), client_ip)
+                    for x in req if isinstance(x, dict)]
+        if not isinstance(req, dict): req = {}
         topic, msg = req.get("topic"), req.get("message")
         rid_ = req.get("request-id", 0)
         log(f"CAS Execute topic={topic} message={msg}")
         if topic == "find":
             return cas_find_response(req)
+        if topic == "tel" and msg == "reset-missed-call-count":
+            log("CAS reset-missed-call-count -> ok")
+            return {"request-id": rid_, "topic": topic, "message": msg, "response": 0}
+        if topic == "history":                     # call log -> phone History screen
+            return cas_history_response(req, ext,
+                                        parse_qs(urlparse(target).query).get("SessionId", [""])[0])
         first, last = _split_name(label or ext or "")
         eprops = {"ext": ext, "did": ext, "firstname": first, "lastname": last,
                   "firstName": first, "lastName": last, "display-name": (label or ext),

@@ -651,6 +651,52 @@ def cas_user_name(ext, label):
 
 UNAUTH = object()   # sentinel: make cas_handle answer HTTP 401 (forces the phone to re-login)
 
+PIN_FAILS = {}               # mac -> [fail_count, locked_until]
+PIN_MAX_FAILS, PIN_LOCK_SECS = 5, 300
+def _is_md5(v): return isinstance(v, str) and re.fullmatch(r"[0-9a-fA-F]{32}", v or "") is not None
+def pin_md5(pin): return hashlib.md5(str(pin).encode()).hexdigest()
+
+def cas_pin(msg, req, ext):
+    rid_ = req.get("request-id", 0)
+    ok = {"request-id": rid_, "topic": "config", "message": msg, "response": 0, "error": 0}
+    bad = {"request-id": rid_, "topic": "config", "message": msg, "response": 1, "error": 1,
+           "error-message": "Invalid password", "results": {}}
+    mac = mac_for_ext(ext) if ext else None
+    if not mac:
+        log(f"CAS {msg}: unidentified phone -> refused")
+        return bad
+    with pstate: stored = PHONES.get(mac, {}).get("tui_pwd_md5", "")
+    if msg == "authenticate-tui-pwd":
+        fails, until = PIN_FAILS.get(mac, [0, 0])
+        if until > time.time():
+            log(f"CAS PIN check {mac}: locked out for {int(until - time.time())}s more"); return bad
+        given = str(req.get("pwd", "")).lower()
+        if not stored or given == stored.lower():
+            PIN_FAILS.pop(mac, None)
+            log(f"CAS PIN check {mac}: accepted" + ("" if stored else " (no PIN set)"))
+            return {**ok, "results": {"must-change": False}, "must-change": False}
+        fails += 1
+        PIN_FAILS[mac] = [fails, time.time() + PIN_LOCK_SECS if fails >= PIN_MAX_FAILS else 0]
+        log(f"CAS PIN check {mac}: WRONG PIN ({fails}/{PIN_MAX_FAILS})"
+            + (" -> locked 5 min" if fails >= PIN_MAX_FAILS else ""))
+        return bad
+    # set-tui-pwd: field names not known yet -> log keys only (never values), take the
+    # md5 that looks like the NEW pin, and require the old one when a PIN is set.
+    log(f"CAS set-tui-pwd {mac}: fields {sorted(k for k in req if k not in ('request-id','topic','message'))}")
+    hashes = {k: str(v).lower() for k, v in req.items() if _is_md5(v)}
+    new = next((v for k, v in hashes.items() if "new" in k), None)
+    old = next((v for k, v in hashes.items() if "old" in k or "cur" in k), None)
+    if new is None and len(hashes) == 1: new = next(iter(hashes.values()))
+    if not new:
+        log(f"CAS set-tui-pwd {mac}: no new PIN found in request -> refused"); return bad
+    if stored and old is not None and old != stored.lower():
+        log(f"CAS set-tui-pwd {mac}: old PIN wrong -> refused"); return bad
+    with pstate:
+        if mac in PHONES: PHONES[mac]["tui_pwd_md5"] = new
+    save_phones(); PIN_FAILS.pop(mac, None)
+    log(f"CAS set-tui-pwd {mac}: PIN changed from the phone")
+    return {**ok, "results": {}}
+
 def _session_ok(target):
     sid = parse_qs(urlparse(target).query).get("SessionId", [""])[0]
     with CAS_LOCK:

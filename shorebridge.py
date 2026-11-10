@@ -44,9 +44,16 @@ _bind    = CFG.get("bridge", "bind_ip", fallback="auto").strip()
 MYIP     = detect_ip(SBC_IP) if _bind in ("", "auto") else _bind
 DATA     = CFG.get("bridge", "data_dir", fallback="/opt/shorebridge")
 TZ       = CFG.get("phone", "timezone", fallback="Eastern Standard Time")
+# Number the phone's Voicemail key dials (voip.ms: *97 = own mailbox).
+VM_NUMBER = CFG.get("phone", "voicemail_number", fallback="*97")
 DEBUG    = CFG.getboolean("bridge", "debug", fallback=False)
 UI_PORT  = CFG.getint("bridge", "ui_port", fallback=8910)
 CSTA_AUTOANSWER = CFG.getboolean("bridge", "csta_test_autoanswer", fallback=False)  # test: auto-fire AnswerCall on inbound ring
+# Reboot connected phones when the bridge is stopped/restarted (SIGTERM). Off by default
+# so dev restarts don't bounce the phone. reboot_when: "on-idle" (wait for no active call)
+# or "immediate". The phone honors Event: reboot;when=<v> over SIP-NOTIFY (firmware-verified).
+REBOOT_ON_RESTART = CFG.getboolean("bridge", "reboot_phones_on_restart", fallback=False)
+REBOOT_WHEN = CFG.get("bridge", "reboot_when", fallback="on-idle").strip() or "on-idle"
 
 HTTP_ROOT = os.path.join(DATA, "www")
 CERT = os.path.join(DATA, "tls", "switch_fullchain.crt")
@@ -114,6 +121,13 @@ def creds_for_mac(mac):
 def mac_for_ext(ext):
     for mac, p in PHONES.items():
         if p["extension"] == ext: return mac
+def mac_for_ip(ip):
+    """Reverse the MAC->IP map (populated at REGISTER). Lets an INVITE that arrives on a
+    TLS connection before this phone has REGISTERed on it still be identified, e.g. a
+    *97 dialed in the gap right after a bridge restart."""
+    if not ip: return None
+    for mac, pip in PHONE_IPS.items():
+        if pip == ip and mac in PHONES: return mac
     return None
 
 # ----------------------------- SIP helpers -----------------------------
@@ -221,6 +235,106 @@ def ensure_registrations():
                 reg_threads[ext] = True
                 threading.Thread(target=reg_loop, args=(ext,), daemon=True).start()
                 log(f"starting registration for ext {ext}")
+            if ext not in mwi_threads:
+                mwi_threads[ext] = True
+                threading.Thread(target=mwi_loop, args=(ext,), daemon=True).start()
+
+# ----------------------------- voicemail light (MWI) -----------------------------
+# PBX side: per extension, SUBSCRIBE to message-summary (digest auth, refreshed) and
+# answer the PBX's NOTIFYs. Phone side: the phone never subscribes, so we push an
+# unsolicited NOTIFY (simple-message-summary) over its TLS connection on every
+# change and whenever it re-registers.
+MWI = {}                 # ext -> {"waiting": bool, "new": int, "old": int}
+mwi_threads = {}
+MWI_SUBS = {}            # PBX subscription Call-ID -> ext
+MWI_PHONE = {}           # mac -> {"callid","tag","cseq"} for our NOTIFY dialog to the phone
+
+def parse_mwi(body):
+    waiting, new, old = False, 0, 0
+    for line in (body or "").splitlines():
+        k, _, v = line.partition(":"); k = k.strip().lower(); v = v.strip()
+        if k == "messages-waiting": waiting = v.lower().startswith("y")
+        elif k == "voice-message":
+            m = re.match(r"(\d+)\s*/\s*(\d+)", v)
+            if m: new, old = int(m.group(1)), int(m.group(2))
+    return {"waiting": waiting or new > 0, "new": new, "old": old}
+
+def on_mwi(ext, st):
+    prev = MWI.get(ext); MWI[ext] = st
+    if prev != st:
+        log(f"voicemail ext {ext}: {st['new']} new / {st['old']} old -> lamp {'ON' if st['waiting'] else 'off'}")
+    mac = mac_for_ext(ext)
+    if mac: push_mwi_to_phone(mac)
+
+def push_mwi_to_phone(mac):
+    with pstate:
+        conn = CONNS.get(mac); contact = CONTACTS.get(mac); p = PHONES.get(mac)
+    if not (conn and contact and p): return
+    ext = str(p.get("extension", "")); st = MWI.get(ext)
+    if st is None: return
+    d = MWI_PHONE.setdefault(mac, {"callid": rid(16) + "@" + MYIP, "tag": rid(8), "cseq": 0})
+    d["cseq"] += 1
+    body = (f"Messages-Waiting: {'yes' if st['waiting'] else 'no'}\r\n"
+            f"Message-Account: sips:{ext}@{MYIP}\r\n"
+            f"Voice-Message: {st['new']}/{st['old']} (0/0)\r\n").encode()
+    L = [f"NOTIFY {contact} SIP/2.0", f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)};rport",
+         "Max-Forwards: 70", f"From: <sips:{ext}@{MYIP}>;tag={d['tag']}", f"To: <sips:{ext}@{MYIP}>",
+         f"Call-ID: {d['callid']}", f"CSeq: {d['cseq']} NOTIFY", "Event: message-summary",
+         "Subscription-State: active;expires=3600", f"Contact: <sips:switch@{MYIP}:5061;transport=tls>",
+         "Content-Type: application/simple-message-summary", f"Content-Length: {len(body)}"]
+    try:
+        conn.sendall(("\r\n".join(L) + "\r\n\r\n").encode() + body)
+        dbg(f"MWI -> phone {mac}: {'yes' if st['waiting'] else 'no'} {st['new']}/{st['old']}")
+    except Exception as e:
+        log(f"MWI push to {mac} failed: {e!r}")
+
+def mwi_loop(ext):
+    callid = rid(16) + "@" + MYIP; ftag = rid(8); cseq = 0; totag = ""; warned = False
+    with pstate: MWI_SUBS[callid] = ext
+    while True:
+        creds = None
+        with pstate:
+            for mac, p in PHONES.items():
+                if p["extension"] == ext: creds = (p["auth_id"], p["password"]); break
+        if creds is None:
+            with pstate: mwi_threads.pop(ext, None); MWI_SUBS.pop(callid, None)
+            log(f"voicemail subscription for ext {ext} stopped (phone removed)"); return
+        authid, password = creds
+        def mk(n, auth=None, hdr="Authorization"):
+            L = [f"SUBSCRIBE sip:{ext}@{DOMAIN} SIP/2.0",
+                 f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch=z9hG4bK{rid(16)};rport", "Max-Forwards: 70",
+                 f"From: <sip:{ext}@{DOMAIN}>;tag={ftag}", f"To: <sip:{ext}@{DOMAIN}>" + (f";tag={totag}" if totag else ""),
+                 f"Call-ID: {callid}", f"CSeq: {n} SUBSCRIBE", f"Contact: <sip:{ext}@{MYIP}:{P3CX}>",
+                 "Event: message-summary", "Accept: application/simple-message-summary",
+                 "Expires: 3600", "User-Agent: ShoreBridge/1.0"]
+            if auth: L.append(f"{hdr}: {auth}")
+            L.append("Content-Length: 0"); return "\r\n".join(L) + "\r\n\r\n"
+        cseq += 1
+        with wlock: waiters[callid] = []
+        u3_send(mk(cseq)); r = wait(callid, 4)
+        if r and r.split("\r\n")[0].split()[1] in ("401", "407"):
+            st = r.split("\r\n")[0]
+            hh = [l for l in r.split("\r\n") if l.lower().startswith(("www-authenticate", "proxy-authenticate"))]
+            realm, nonce, qop, opaque = parse_auth(hh[0]) if hh else (None,) * 4
+            hdr = "Proxy-Authorization" if " 407 " in st else "Authorization"
+            auth = digest("SUBSCRIBE", f"sip:{ext}@{DOMAIN}", realm, nonce, qop, rid(16), "00000001", opaque, authid, password)
+            cseq += 1
+            with wlock: waiters[callid] = []
+            u3_send(mk(cseq, auth, hdr)); r = wait(callid, 4)
+        with wlock: waiters.pop(callid, None)
+        code = r.split("\r\n")[0].split()[1] if r else "timeout"
+        if code.startswith("2"):
+            _, h, _ = parse(r); m = re.search(r";tag=([^;>\s]+)", H(h, "to"))
+            if m: totag = m.group(1)
+            try: exp = int(re.sub(r"\D", "", H(h, "expires")) or 3600)
+            except Exception: exp = 3600
+            if warned or not MWI.get(ext): dbg(f"voicemail subscription ext {ext}: {code}, expires {exp}s")
+            warned = False
+            time.sleep(max(60, min(exp - 60, 1800)))
+        else:
+            if not warned: log(f"voicemail subscription ext {ext} failed: {code} (retrying every 10 min)")
+            warned = True; totag = ""
+            time.sleep(600)
 
 CALLS = {}
 PIN = {}; pinlock = threading.Lock()
@@ -247,7 +361,20 @@ def _dispatch(start, hdrs, cid, msg, addr):
         if method == "OPTIONS":
             u3_send(resp_line(200, "OK", hdrs))
         elif method == "INVITE":
-            threading.Thread(target=inbound_invite, args=(hdrs, msg, addr), daemon=True).start()
+            cs = CALLS.get(cid)
+            if cs and cs.alive and ";tag=" in H(hdrs, "to"):      # in-dialog re-INVITE
+                threading.Thread(target=pbx_reinvite, args=(cs, hdrs, msg, addr), daemon=True).start()
+            else:
+                threading.Thread(target=inbound_invite, args=(hdrs, msg, addr), daemon=True).start()
+        elif method == "NOTIFY":
+            u3.sendto(resp_line(200, "OK", hdrs).encode(), addr)
+            if "message-summary" in H(hdrs, "event").lower():
+                _, _, body = parse(msg)
+                ext = MWI_SUBS.get(cid)
+                if not ext:                          # unsolicited: take the user part of To
+                    m = re.search(r"sips?:([^@>;]+)@", H(hdrs, "to")); ext = m.group(1) if m else ""
+                if ext and mac_for_ext(ext): on_mwi(ext, parse_mwi(body))
+                elif DEBUG: dbg(f"MWI NOTIFY for unknown ext {ext!r}")
         elif method in ("BYE", "CANCEL", "ACK"):
             for cs in list(CALLS.values()):
                 if cs.x_callid == cid: cs.on_3cx_request(method, hdrs, msg)
@@ -275,6 +402,247 @@ def sdp_media(sdp):
         if line.startswith("m=audio") and port is None: port = int(line.split()[1])
     return (ip, port) if ip and port else None
 
+# ----------------------------- call log (for the phone's History) -----------------------------
+HISTORY_FMT_JSON = os.path.join(DATA, "history_format.json")
+CALLLOG_LOCK = threading.Lock()
+CALLLOG_MAX = 200
+
+def load_calllog():
+    try:
+        with open(CALLS_JSON) as f: d = json.load(f); return d if isinstance(d, list) else []
+    except Exception: return []
+
+def _digits(n): return re.sub(r"\D", "", str(n or ""))[-10:]
+def name_for_number(num):
+    """Best-effort caller name from the directory / configured phones (last 10 digits)."""
+    key = _digits(num)
+    if not key: return ""
+    for e in load_directory():
+        if _digits(e.get("number")) == key: return e.get("name", "")
+    for p in PHONES.values():
+        if _digits(p.get("extension")) == key: return p.get("label", "")
+    return ""
+
+def delete_calllog(ext, ids=None):
+    """Remove this extension's records: all of them (ids=None) or just those ids.
+    Other phones' records are never touched. Returns the number removed."""
+    if not ext: return 0                        # unidentified phone: never delete
+    with CALLLOG_LOCK:
+        log_ = load_calllog()
+        keep = [r for r in log_ if (ext and r.get("ext") != ext)
+                or (ids is not None and r.get("id") not in ids)]
+        removed = len(log_) - len(keep)
+        if removed:
+            # remember the highest id ever issued before dropping records, so it is never reused
+            seq_f = CALLS_JSON + ".seq"
+            try: last = int(open(seq_f).read().strip() or 0)
+            except Exception: last = 0
+            hi = max([last] + [r.get("id", 0) for r in log_])
+            with open(seq_f, "w") as f: f.write(str(hi))
+            tmp = CALLS_JSON + ".tmp"
+            with open(tmp, "w") as f: json.dump(keep, f, indent=1)
+            os.replace(tmp, CALLS_JSON)
+    return removed
+
+def record_call(cs):
+    try:
+        peer = getattr(cs, "peer", "") or cs.dst
+        start = getattr(cs, "t_start", None) or time.time(); up = getattr(cs, "t_up", None)
+        direction = getattr(cs, "direction", "out")
+        rec = {"ext": cs.ext, "mac": cs.mac, "direction": direction, "number": peer,
+               "name": name_for_number(peer), "start": int(start),
+               "duration": int(time.time() - up) if up else 0,
+               "answered": bool(up), "missed": direction == "in" and not up}
+        with CALLLOG_LOCK:
+            log_ = load_calllog()
+            # ids are never reused (the phone caches recids): keep a high-water mark
+            seq_f = CALLS_JSON + ".seq"
+            try: last = int(open(seq_f).read().strip() or 0)
+            except Exception: last = 0
+            rec["id"] = max(last, max((r.get("id", 0) for r in log_), default=0)) + 1
+            with open(seq_f, "w") as f: f.write(str(rec["id"]))
+            log_.append(rec); log_ = log_[-CALLLOG_MAX:]
+            tmp = CALLS_JSON + ".tmp"
+            with open(tmp, "w") as f: json.dump(log_, f, indent=1)
+            os.replace(tmp, CALLS_JSON)
+        log(f"call log: #{rec['id']} {direction} {peer} {'missed' if rec['missed'] else str(rec['duration'])+'s'}")
+    except Exception as e:
+        log("call log err " + repr(e))
+
+# History reply format, from the IP485g firmware (bin/linemgrSip, CasCallLogsParser):
+# reply keys request-id/response/details/message + "records"; records use the same
+# COLUMNAR layout as the directory: element[0] = header (field names), then rows.
+# Record fields: recid rec-type ts-start duration-secs time-label secure
+# call-recording-flag parties; each party list is columnar too: name number
+# number-canonical. The numeric rec-type codes are NOT in the binary as text, so
+# they (and the ts-start unit) are read from history_format.json on every request.
+HIST_HDR  = ["recid", "rec-type", "ts-start", "duration-secs", "time-label", "secure",
+             "call-recording-flag", "parties"]
+HISTORY_FMT_DEFAULT = {"rec_type": {"in": 1, "out": 2, "missed": 3}, "ts_units": "s", "time_label": 0}
+
+def _canon(num):
+    d = re.sub(r"\D", "", str(num or ""))
+    if len(d) == 10: return "+1" + d
+    if len(d) == 11 and d.startswith("1"): return "+" + d
+    return str(num or "")
+
+def cas_history_response(req, ext, sid=""):
+    try:
+        with open(HISTORY_FMT_JSON) as f: fmt = {**HISTORY_FMT_DEFAULT, **json.load(f)}
+    except Exception: fmt = HISTORY_FMT_DEFAULT
+    msg = req.get("message"); rid_ = req.get("request-id", 0)
+    base = {"request-id": rid_, "topic": "history", "message": msg, "response": 0}
+    if msg in ("delete-recs", "delete-all"):
+        log(f"CAS history {msg} request: {json.dumps(req)[:300]}")
+        ids = req.get("recids", req.get("recid", []))
+        if not isinstance(ids, list): ids = [ids]
+        ids = {int(x) for x in ids if str(x).lstrip("-").isdigit()}
+        n = delete_calllog(ext, None if msg == "delete-all" else ids)
+        log(f"CAS history {msg} -> removed {n} rec(s) for ext {ext}")
+        return base
+    if msg not in ("get-recs", "get-page-view"):
+        log(f"CAS history {msg} -> ok"); return base          # close-page-view etc.
+    recs = [r for r in load_calllog() if not ext or r.get("ext") == ext]
+    # newest first, except get-recs forward=true (asks for the oldest end)
+    recs.sort(key=lambda r: r.get("start", 0), reverse=not (msg == "get-recs" and req.get("forward")))
+    try: mx = int(req.get("max", req.get("count", 50)))   # get-page-view uses "count"
+    except Exception: mx = 50
+    rt = fmt.get("rec_type", HISTORY_FMT_DEFAULT["rec_type"])
+    mult = 1000 if fmt.get("ts_units") == "ms" else 1
+    rows = [HIST_HDR]
+    for r in recs[:max(0, mx)]:
+        kind = "missed" if r.get("missed") else ("in" if r.get("direction") == "in" else "out")
+        name = r.get("name") or ""
+        parties = [PARTY_HDR, [name, str(r.get("number", "")), _canon(r.get("number"))]]
+        rows.append([r.get("id", 0), rt.get(kind, 0), int(r.get("start", 0)) * mult,
+                     int(r.get("duration", 0)), fmt.get("time_label", 0), False, False, parties])
+    resp = {**base, "records": rows}
+    log(f"CAS history {msg} max={req.get('max')} count={req.get('count')} forward={req.get('forward')} -> {len(rows)-1} rec(s)")
+    if DEBUG: dbg("CAS history reply: " + json.dumps(resp)[:800])
+    return resp
+
+# ---- in-dialog re-INVITE (hold / resume / session-timer refresh) ----
+# Both legs are answered locally by the bridge: the RTP relay keeps running, we just
+# mirror the offered direction so each side sees a valid answer. Without this a
+# re-INVITE was treated as a brand-new call (Hold dropped the phone's call leg).
+_MIRROR = {"sendonly": "recvonly", "recvonly": "sendonly", "inactive": "inactive", "sendrecv": "sendrecv"}
+def sdp_dir(sdp):
+    """Direction of the first audio m-section of an offer (c=0.0.0.0 = old-style hold)."""
+    d = "sendrecv"; in_audio = False; seen = False
+    for line in (sdp or "").split("\n"):
+        line = line.strip()
+        if line.startswith("m="):
+            if seen: break
+            in_audio = line.startswith("m=audio"); seen = seen or in_audio
+        elif line.startswith("c=IN IP4 0.0.0.0"): d = "inactive"
+        elif in_audio and line[2:] in _MIRROR and line.startswith("a="): d = line[2:]
+    return d
+def _next_ver(cs):
+    cs.sdp_ver = getattr(cs, "sdp_ver", 1) + 1; return cs.sdp_ver
+def reinvite_answer(cs, offer, leg):
+    """Answer SDP for a re-INVITE on leg 'phone' or 'pbx', same m-line count as the offer."""
+    d = _MIRROR.get(sdp_dir(offer), "sendrecv"); v = _next_ver(cs)
+    nm = max(1, sum(1 for l in (offer or "").split("\n") if l.startswith("m=")))
+    if leg == "phone":
+        sdp = ("v=0\r\n" f"o=switch 1 {v} IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
+               f"m=audio {cs.rpP} RTP/AVP 0 {cs.phone_te}\r\n" "a=rtpmap:0 PCMU/8000\r\n"
+               f"a=rtpmap:{cs.phone_te} telephone-event/8000\r\n" "a=ptime:20\r\n" f"a={d}\r\n")
+        sdp += "m=audio 0 RTP/SAVP 0\r\n" * (nm - 1)
+    else:
+        sdp = ("v=0\r\n" f"o=bridge 1 {v} IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
+               f"m=audio {cs.rp3} RTP/AVP 0 {cs.pbx_te}\r\n" "a=rtpmap:0 PCMU/8000\r\n"
+               f"a=rtpmap:{cs.pbx_te} telephone-event/8000\r\n" f"a={d}\r\n")
+        sdp += "m=audio 0 RTP/AVP 0\r\n" * (nm - 1)
+    return sdp, d
+
+def phone_reinvite(conn, cs, hdrs, body, addr):
+    m = sdp_media(body)
+    if m and m[1] and m[0] != "0.0.0.0": cs.phone_rtp = m
+    ans, d = reinvite_answer(cs, body, "phone")
+    conn.sendall(p_resp(200, "OK", hdrs, addr, "INVITE", sdp=ans))
+    pd = sdp_dir(body)
+    log(f"phone re-INVITE on {cs.dst}: {pd} -> answered {d}"
+        + (" (hold)" if d in ("recvonly", "inactive") else ""))
+    # Pass hold/resume on to the PBX so it plays its music-on-hold to the far end.
+    # Skip pure session-timer refreshes (direction unchanged).
+    if pd != getattr(cs, "x_dir", "sendrecv"):
+        threading.Thread(target=x_reinvite, args=(cs, pd), daemon=True).start()
+
+def x_reinvite(cs, direction):
+    """In-dialog re-INVITE to the PBX leg offering `direction` (sendonly = hold,
+    sendrecv = resume). Handles one digest challenge, ACKs the 2xx."""
+    leg = cs.x_dialog
+    if not leg: return
+    with pstate: creds = creds_for_mac(cs.mac)
+    authid, password = (creds[1], creds[2]) if creds else (cs.authid, cs.password)
+    v = _next_ver(cs)
+    sdp = ("v=0\r\n" f"o=bridge 1 {v} IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
+           f"m=audio {cs.rp3} RTP/AVP 0 {cs.pbx_te}\r\n" "a=rtpmap:0 PCMU/8000\r\n"
+           f"a=rtpmap:{cs.pbx_te} telephone-event/8000\r\n" f"a={direction}\r\n").encode()
+    def mk(cseq, branch, auth=None, hdr="Proxy-Authorization"):
+        L = [f"INVITE {leg['ruri']} SIP/2.0",
+             f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch={branch};rport"]
+        L += [f"Route: {rt}" for rt in leg.get("route", [])]
+        L += ["Max-Forwards: 70", f"From: {leg['local']};tag={leg['ltag']}", f"To: {leg['remote']}",
+              f"Call-ID: {leg['callid']}", f"CSeq: {cseq} INVITE",
+              f"Contact: <sip:{cs.ext}@{MYIP}:{P3CX}>", "User-Agent: ShoreBridge/1.0"]
+        if auth: L.append(f"{hdr}: {auth}")
+        L += ["Content-Type: application/sdp", f"Content-Length: {len(sdp)}"]
+        return ("\r\n".join(L) + "\r\n\r\n").encode() + sdp
+    def ack(cseq, resp, branch):
+        # non-2xx ACK reuses the INVITE's branch (same transaction); 2xx ACK gets a new one
+        _, h, _ = parse(resp)
+        if resp.split("\r\n")[0].split()[1].startswith("2"): branch = "z9hG4bK" + rid(16)
+        L = [f"ACK {leg['ruri']} SIP/2.0", f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch={branch};rport"]
+        L += [f"Route: {rt}" for rt in leg.get("route", [])]
+        L += ["Max-Forwards: 70", f"From: {leg['local']};tag={leg['ltag']}", f"To: {H(h,'to') or leg['remote']}",
+              f"Call-ID: {leg['callid']}", f"CSeq: {cseq} ACK", "Content-Length: 0"]
+        u3.sendto(("\r\n".join(L) + "\r\n\r\n").encode(), SBC)
+    leg["cseq"] = leg.get("cseq", 1) + 1; cseq = leg["cseq"]
+    br = "z9hG4bK" + rid(16)
+    with wlock: waiters[leg["callid"]] = []
+    u3.sendto(mk(cseq, br), SBC)
+    r = wait_invite(leg["callid"], 6, cseq=cseq)
+    if r and r.split("\r\n")[0].split()[1] in ("401", "407"):
+        st = r.split("\r\n")[0]; ack(cseq, r, br)
+        hh = [l for l in r.split("\r\n") if l.lower().startswith(("www-authenticate", "proxy-authenticate"))]
+        realm, nonce, qop, opaque = parse_auth(hh[0])
+        hdr = "Proxy-Authorization" if " 407 " in st else "Authorization"
+        auth = digest("INVITE", leg["ruri"], realm, nonce, qop, rid(16), "00000001", opaque, authid, password)
+        leg["cseq"] += 1; cseq = leg["cseq"]; br = "z9hG4bK" + rid(16)
+        with wlock: waiters[leg["callid"]] = []
+        u3.sendto(mk(cseq, br, auth, hdr), SBC)
+        r = wait_invite(leg["callid"], 6, cseq=cseq)
+    code = r.split("\r\n")[0].split()[1] if r else "timeout"
+    if DEBUG:
+        dbg("PBX re-INVITE SENT >>>>\n" + mk(cseq, br).decode("utf-8", "replace").strip() + "\n<<<< end")
+        dbg("PBX re-INVITE REPLY >>>>\n" + (r or "(none)").strip() + "\n<<<< end")
+    if r and code.isdigit() and int(code) >= 200: ack(cseq, r, br)
+    if code == "200":
+        _, _, rb = parse(r); m = sdp_media(rb)
+        if m and m[1] and m[0] != "0.0.0.0": cs.x_rtp = m
+        cs.x_dir = direction
+    log(f"PBX re-INVITE {direction} on {cs.dst}: {code}" + (" (hold music from PBX)" if direction != "sendrecv" and code == "200" else ""))
+
+def pbx_reinvite(cs, xh, xraw, xaddr):
+    _, _, xbody = parse(xraw)
+    m = sdp_media(xbody)
+    if m and m[1] and m[0] != "0.0.0.0": cs.x_rtp = m
+    to = H(xh, "to")
+    # (an offer-less re-INVITE gets our sendrecv offer here; its answer comes in the ACK)
+    ans, d = reinvite_answer(cs, xbody, "pbx"); ob = ans.encode()
+    extra = ["Content-Type: application/sdp", f"Content-Length: {len(ob)}"]
+    L = ["SIP/2.0 200 OK"] + allvia(xh) + allrr(xh) + [f"From: {H(xh,'from')}", f"To: {to}",
+         f"Call-ID: {H(xh,'call-id')}", f"CSeq: {H(xh,'cseq')}",
+         f"Contact: <sip:{cs.ext}@{MYIP}:{P3CX}>"] + extra
+    u3.sendto(("\r\n".join(L) + "\r\n\r\n").encode() + ob, xaddr)
+    log(f"PBX re-INVITE on {cs.dst}: {sdp_dir(xbody)} -> answered {d}")
+
+def sdp_te_pt(sdp):
+    """Payload type the SDP assigns to telephone-event (RFC 4733 DTMF), or None."""
+    m = re.search(r"a=rtpmap:(\d+)\s+telephone-event/", sdp or "", re.I)
+    return int(m.group(1)) if m else None
+
 class CallSession:
     def __init__(s, dst, conn, mac, ext, authid, password):
         s.dst = dst; s.pc = conn; s.mac = mac
@@ -285,6 +653,8 @@ class CallSession:
         s.phone_rtp = None; s.x_rtp = None
         s.alive = True; s.p_ftag = None; s.p_totag = None; s.p_addr = None
         s.p_dialog = None; s.x_dialog = None; s.p_inv = None
+        s.t_start = time.time(); s.t_up = None; s.direction = "out"; s.peer = dst
+        s.phone_te = 102; s.pbx_te = 101      # DTMF payload types negotiated on each leg
     def on_3cx_response(s, msg): pass
     def on_3cx_request(s, method, hdrs, msg):
         if method in ("BYE", "CANCEL"): s.teardown(origin="3cx")
@@ -299,6 +669,14 @@ class CallSession:
             for so in r:
                 try: d, a = so.recvfrom(4096)
                 except Exception: continue
+                # DTMF (telephone-event) uses a different payload-type number on each
+                # leg; relabel it or the far end drops the digits.
+                if len(d) >= 12 and (d[0] >> 6) == 2:
+                    pt = d[1] & 0x7F
+                    if so is s.sockP and pt == s.phone_te and s.pbx_te != s.phone_te:
+                        d = d[:1] + bytes([(d[1] & 0x80) | s.pbx_te]) + d[2:]
+                    elif so is s.sock3 and pt == s.pbx_te and s.pbx_te != s.phone_te:
+                        d = d[:1] + bytes([(d[1] & 0x80) | s.phone_te]) + d[2:]
                 if so is s.sockP:
                     s.phone_rtp = a; np_ += 1
                     if s.x_rtp:
@@ -335,6 +713,7 @@ class CallSession:
             except Exception: pass
         CALLS.pop(s.p_callid, None); CALLS.pop(s.x_callid, None)
         log(f"call {s.dst} ended (origin={origin})")
+        record_call(s)
 
 # ----------------------------- outbound: phone -> PBX -----------------------------
 def x_invite(cs):
@@ -429,6 +808,11 @@ def p_resp(code, reason, hdrs, addr, method, sdp=None):
 def phone_invite(conn, mac, hdrs, body, addr):
     to = H(hdrs, "to"); m = re.search(r'sips?:([^@>]+)@', to); dst = m.group(1) if m else "0"
     creds = creds_for_mac(mac)
+    if not creds:                                  # no MAC on this connection yet -> identify by source IP
+        alt = mac_for_ip(addr[0])
+        if alt:
+            log(f"INVITE with no MAC on connection; identified {alt} by IP {addr[0]}")
+            mac = alt; creds = creds_for_mac(mac)
     if not creds:
         log(f"unconfigured phone {mac} tried to dial {dst}")
         conn.sendall(p_resp(403, "Forbidden", hdrs, addr, "INVITE")); return
@@ -446,6 +830,7 @@ def phone_invite(conn, mac, hdrs, body, addr):
         log(f"PBX rejected: {r.splitlines()[0]}")
         conn.sendall(p_resp(code if code < 700 else 486, "Declined", hdrs, addr, "INVITE")); cs.teardown(); return
     _, xh, xb = parse(r); cs.x_rtp = sdp_media(xb); cs.x_totag = H(xh, "to"); x_ack_ok(r, cs)
+    cs.pbx_te = sdp_te_pt(xb) or 101; cs.phone_te = sdp_te_pt(body) or 102
     cs.x_dialog = {'ruri': uri_of(H(xh, "contact")) or f"sip:{dst}@{DOMAIN}", 'transport': 'UDP', 'lport': P3CX,
                    'local': f"<sip:{ext}@{DOMAIN}>", 'ltag': cs.x_ftag, 'remote': H(xh, "to"),
                    'callid': cs.x_callid, 'route': list(reversed(xh.get("record-route", []))), 'cseq': 2}
@@ -454,10 +839,24 @@ def phone_invite(conn, mac, hdrs, body, addr):
                    'callid': cs.p_callid, 'route': [], 'cseq': 1, 'conn': conn}
     threading.Thread(target=cs.relay, daemon=True).start()
     ans = ("v=0\r\n" f"o=switch 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
-           f"m=audio {cs.rpP} RTP/AVP 0 102\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:102 telephone-event/8000\r\n" "a=ptime:20\r\n" "a=sendrecv\r\n"
+           f"m=audio {cs.rpP} RTP/AVP 0 {cs.phone_te}\r\n" "a=rtpmap:0 PCMU/8000\r\n" f"a=rtpmap:{cs.phone_te} telephone-event/8000\r\n" "a=ptime:20\r\n" "a=sendrecv\r\n"
            "m=audio 0 RTP/SAVP 0\r\n")
     conn.sendall(p_resp(200, "OK", hdrs, addr, "INVITE", sdp=ans))
     log(f"call up: ext {ext} <-> {dst}")
+PHONE_IPS_JSON = os.path.join(DATA, "phone_ips.json")
+def save_phone_ips():
+    """Persist MAC -> last IP so that right after a bridge restart CAS can still tell
+    which phone is talking (the phone reconnects CAS ~2 min before it re-registers SIP)."""
+    try:
+        tmp = PHONE_IPS_JSON + ".tmp"
+        with open(tmp, "w") as f: json.dump(PHONE_IPS, f, indent=1)
+        os.replace(tmp, PHONE_IPS_JSON)
+    except Exception as e: log("save phone ips err " + repr(e))
+def load_phone_ips():
+    try:
+        with open(PHONE_IPS_JSON) as f: d = json.load(f)
+        if isinstance(d, dict): PHONE_IPS.update({norm_mac(k) or k: v for k, v in d.items()})
+    except Exception: pass
 
 def register_phone(conn, hdrs, addr):
     """Handle a phone REGISTER: identify by MAC, attach its connection; unknown MACs go to SEEN for the UI."""
@@ -465,7 +864,9 @@ def register_phone(conn, hdrs, addr):
     ct = uri_of(H(hdrs, "contact"))
     with pstate:
         CONNS[mac] = conn
+        changed = PHONE_IPS.get(mac) != addr[0]
         PHONE_IPS[mac] = addr[0]            # so CAS (a separate connection) can map IP -> extension
+        if changed: save_phone_ips()
         if ct: CONTACTS[mac] = ct
         if mac in PHONES:
             SEEN.pop(mac, None); known = True
@@ -527,8 +928,21 @@ def phone_handle(conn, addr):
             if method == "REGISTER":
                 mymac = register_phone(conn, hdrs, addr)
                 conn.sendall(p_resp(200, "OK", hdrs, addr, method))
+                if mymac: threading.Timer(2.0, push_mwi_to_phone, args=(mymac,)).start()
             elif method == "INVITE":
-                threading.Thread(target=phone_invite, args=(conn, mymac, hdrs, b, addr), daemon=True).start()
+                cs = CALLS.get(H(hdrs, "call-id"))
+                if cs and cs.alive and ";tag=" in H(hdrs, "to"):  # in-dialog re-INVITE (hold/resume/refresh)
+                    try: phone_reinvite(conn, cs, hdrs, b, addr)
+                    except Exception as e: log(f"phone re-INVITE err {e!r}")
+                else:
+                    threading.Thread(target=phone_invite, args=(conn, mymac, hdrs, b, addr), daemon=True).start()
+            elif method == "SUBSCRIBE":
+                ev = H(hdrs, "event")
+                log(f"phone {mymac} SUBSCRIBE Event: {ev} Accept: {H(hdrs, 'accept')[:120]}")
+                if ev.split(";")[0].strip().lower() == "ua-profile":
+                    threading.Thread(target=ua_profile_subscribe, args=(conn, mymac, hdrs, addr), daemon=True).start()
+                else:
+                    conn.sendall(p_resp(200, "OK", hdrs, addr, method))
             elif method == "BYE":
                 cs = CALLS.get(H(hdrs, "call-id"))
                 conn.sendall(p_resp(200, "OK", hdrs, addr, method))
@@ -651,6 +1065,56 @@ def cas_user_name(ext, label):
 
 UNAUTH = object()   # sentinel: make cas_handle answer HTTP 401 (forces the phone to re-login)
 
+# ---- Options-menu PIN ("voicemail password" prompt) ----
+# The phone sends md5(PIN digits) as lowercase hex in "pwd". Each phone's PIN is kept
+# the same way in phones.json ("tui_pwd_md5"). No PIN set -> any PIN opens Options
+# (never lock the user out). 5 wrong tries -> Options locked for 5 minutes.
+PIN_FAILS = {}               # mac -> [fail_count, locked_until]
+PIN_MAX_FAILS, PIN_LOCK_SECS = 5, 300
+def _is_md5(v): return isinstance(v, str) and re.fullmatch(r"[0-9a-fA-F]{32}", v or "") is not None
+def pin_md5(pin): return hashlib.md5(str(pin).encode()).hexdigest()
+
+def cas_pin(msg, req, ext):
+    rid_ = req.get("request-id", 0)
+    ok = {"request-id": rid_, "topic": "config", "message": msg, "response": 0, "error": 0}
+    bad = {"request-id": rid_, "topic": "config", "message": msg, "response": 1, "error": 1,
+           "error-message": "Invalid password", "results": {}}
+    mac = mac_for_ext(ext) if ext else None
+    if not mac:
+        log(f"CAS {msg}: unidentified phone -> refused")
+        return bad
+    with pstate: stored = PHONES.get(mac, {}).get("tui_pwd_md5", "")
+    if msg == "authenticate-tui-pwd":
+        fails, until = PIN_FAILS.get(mac, [0, 0])
+        if until > time.time():
+            log(f"CAS PIN check {mac}: locked out for {int(until - time.time())}s more"); return bad
+        given = str(req.get("pwd", "")).lower()
+        if not stored or given == stored.lower():
+            PIN_FAILS.pop(mac, None)
+            log(f"CAS PIN check {mac}: accepted" + ("" if stored else " (no PIN set)"))
+            return {**ok, "results": {"must-change": False}, "must-change": False}
+        fails += 1
+        PIN_FAILS[mac] = [fails, time.time() + PIN_LOCK_SECS if fails >= PIN_MAX_FAILS else 0]
+        log(f"CAS PIN check {mac}: WRONG PIN ({fails}/{PIN_MAX_FAILS})"
+            + (" -> locked 5 min" if fails >= PIN_MAX_FAILS else ""))
+        return bad
+    # set-tui-pwd: field names not known yet -> log keys only (never values), take the
+    # md5 that looks like the NEW pin, and require the old one when a PIN is set.
+    log(f"CAS set-tui-pwd {mac}: fields {sorted(k for k in req if k not in ('request-id','topic','message'))}")
+    hashes = {k: str(v).lower() for k, v in req.items() if _is_md5(v)}
+    new = next((v for k, v in hashes.items() if "new" in k), None)
+    old = next((v for k, v in hashes.items() if "old" in k or "cur" in k), None)
+    if new is None and len(hashes) == 1: new = next(iter(hashes.values()))
+    if not new:
+        log(f"CAS set-tui-pwd {mac}: no new PIN found in request -> refused"); return bad
+    if stored and old is not None and old != stored.lower():
+        log(f"CAS set-tui-pwd {mac}: old PIN wrong -> refused"); return bad
+    with pstate:
+        if mac in PHONES: PHONES[mac]["tui_pwd_md5"] = new
+    save_phones(); PIN_FAILS.pop(mac, None)
+    log(f"CAS set-tui-pwd {mac}: PIN changed from the phone")
+    return {**ok, "results": {}}
+
 def _session_ok(target):
     sid = parse_qs(urlparse(target).query).get("SessionId", [""])[0]
     with CAS_LOCK:
@@ -692,11 +1156,24 @@ def cas_dispatch(method, target, body, client_ip=""):
             return UNAUTH
         try: req = json.loads(body or "{}")
         except Exception: req = {}
+        # The phone batches requests as a JSON array (e.g. two history get-recs after a
+        # call). Answer each one and return an array. Previously this crashed the
+        # handler, the phone got no reply and fell into a re-login loop.
+        if isinstance(req, list):
+            return [cas_dispatch(method, target, json.dumps(x), client_ip)
+                    for x in req if isinstance(x, dict)]
+        if not isinstance(req, dict): req = {}
         topic, msg = req.get("topic"), req.get("message")
         rid_ = req.get("request-id", 0)
         log(f"CAS Execute topic={topic} message={msg}")
         if topic == "find":
             return cas_find_response(req)
+        if topic == "tel" and msg == "reset-missed-call-count":
+            log("CAS reset-missed-call-count -> ok")
+            return {"request-id": rid_, "topic": topic, "message": msg, "response": 0}
+        if topic == "history":                     # call log -> phone History screen
+            return cas_history_response(req, ext,
+                                        parse_qs(urlparse(target).query).get("SessionId", [""])[0])
         first, last = _split_name(label or ext or "")
         eprops = {"ext": ext, "did": ext, "firstname": first, "lastname": last,
                   "firstName": first, "lastName": last, "display-name": (label or ext),
@@ -843,7 +1320,8 @@ def inbound_invite(xh, xraw, xaddr):
         log(f"inbound for ext {ext}: no phone online"); u3.sendto(resp_line(480, "Unavailable", xh).encode(), xaddr); return
     fm = re.search(r'sips?:([^@>;]+)', H(xh, "from")); caller = fm.group(1) if fm else "unknown"
     cs = CallSession("inbound", conn, mac, ext, "", "")
-    cs.x_callid = H(xh, "call-id"); cs.x_rtp = sdp_media(xbody)
+    cs.direction = "in"; cs.peer = caller
+    cs.x_callid = H(xh, "call-id"); cs.x_rtp = sdp_media(xbody); cs.pbx_te = sdp_te_pt(xbody) or 101
     cs.p_callid = rid(16) + "@" + MYIP; cs.p_ftag = rid(8)
     CALLS[cs.x_callid] = cs; CALLS[cs.p_callid] = cs
     with pstate:
@@ -891,6 +1369,7 @@ def inbound_invite(xh, xraw, xaddr):
     if code >= 300:
         u3.sendto(resp_line(486, "Busy Here", xh).encode(), xaddr); cs.teardown(); return
     _, ph, pb = parse(final); cs.phone_rtp = sdp_media(pb); cs.p_totag = H(ph, "to")
+    cs.phone_te = sdp_te_pt(pb) or 102
     ack = ("\r\n".join([
         f"ACK {phone_uri} SIP/2.0", f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)}",
         "Max-Forwards: 70", f"From: <sips:{caller}@{MYIP}>;tag={cs.p_ftag}", f"To: {cs.p_totag}",
@@ -899,7 +1378,7 @@ def inbound_invite(xh, xraw, xaddr):
     except Exception: pass
     threading.Thread(target=cs.relay, daemon=True).start()
     osdp = ("v=0\r\n" f"o=bridge 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
-            f"m=audio {cs.rp3} RTP/AVP 0 101\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:101 telephone-event/8000\r\n" "a=sendrecv\r\n")
+            f"m=audio {cs.rp3} RTP/AVP 0 {cs.pbx_te}\r\n" "a=rtpmap:0 PCMU/8000\r\n" f"a=rtpmap:{cs.pbx_te} telephone-event/8000\r\n" "a=sendrecv\r\n")
     ob = osdp.encode(); to2 = H(xh, "to")
     if ";tag=" not in to2: to2 = to2 + ";tag=" + mktag(cs.x_callid + "in")
     L = [f"SIP/2.0 200 OK"] + allvia(xh) + allrr(xh) + [f"From: {H(xh,'from')}", f"To: {to2}",
@@ -1003,6 +1482,64 @@ def send_to_phone_csta(mac, body):
     if out: log(f"CSTA << phone {mac}:\n{out.strip()}")
     return out or "(no reply from phone in 5s)"
 
+def send_to_phone_notify(mac, event, ctype, body, from_user="switch"):
+    """DEBUG: send an arbitrary out-of-dialog NOTIFY to a phone and return its reply."""
+    conn = CONNS.get(mac); contact = CONTACTS.get(mac)
+    if not conn or not contact:
+        return "(phone not connected)"
+    callid = rid(16) + "@" + MYIP; b = body.encode()
+    msg = ("\r\n".join([
+        f"NOTIFY {contact} SIP/2.0",
+        f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)};rport", "Max-Forwards: 70",
+        f"From: <sips:{from_user}@{MYIP}>;tag={rid(8)}", f"To: <{contact}>",
+        f"Call-ID: {callid}", "CSeq: 1 NOTIFY", f"Event: {event}", "Subscription-State: active;expires=3600",
+        f"Contact: <sips:switch@{MYIP}:5061;transport=tls>",
+        f"Content-Type: {ctype}", f"Content-Length: {len(b)}"]) + "\r\n\r\n").encode() + b
+    with pinlock: PIN[callid] = []
+    log(f"DEBUG NOTIFY >> phone {mac}: Event {event}, {ctype}, {len(b)} bytes")
+    try: conn.sendall(msg)
+    except Exception as e:
+        with pinlock: PIN.pop(callid, None)
+        return f"(send error: {e})"
+    end = time.time() + 5; out = None
+    while time.time() < end:
+        with pinlock: q = list(PIN.get(callid, []))
+        if q: out = q[-1]; break
+        time.sleep(0.05)
+    with pinlock: PIN.pop(callid, None)
+    first = (out or "").split("\r\n")[0]
+    log(f"DEBUG NOTIFY << phone {mac}: {first or '(no reply in 5s)'}")
+    return out or "(no reply from phone in 5s)"
+
+def reboot_phone(mac, when=None):
+    """Tell a connected phone to reboot via an unsolicited SIP-NOTIFY
+    'Event: reboot;when=<immediate|on-idle>'. Firmware-verified: NotifyClr::
+    EvUnhandledRequest matches event 'reboot' and reads the 'when' Event-header param
+    (handlePphoneRebootEvent). 'on-idle' defers until the phone has no active call."""
+    when = (when or REBOOT_WHEN).strip().lower()
+    if when not in ("immediate", "on-idle"): when = "on-idle"
+    if mac not in CONNS or mac not in CONTACTS:
+        log(f"reboot {mac}: phone not connected"); return "(phone not connected)"
+    log(f"reboot -> phone {mac}: when={when}")
+    return send_to_phone_notify(mac, f"reboot;when={when}", "text/plain", "", "switch")
+
+def reboot_all_phones(when=None):
+    macs = [m for m in list(CONNS.keys()) if m in CONTACTS]
+    if not macs: log("reboot-all: no connected phones"); return
+    log(f"reboot-all: notifying {len(macs)} phone(s) (when={(when or REBOOT_WHEN)})")
+    for m in macs:
+        try: reboot_phone(m, when)
+        except Exception as e: log(f"reboot {m} err: {e!r}")
+
+def _on_shutdown(signum, frame):
+    """SIGTERM/SIGINT: optionally reboot connected phones before the bridge exits."""
+    log(f"shutdown signal {signum}" + (f"; rebooting phones (when={REBOOT_WHEN})" if REBOOT_ON_RESTART else ""))
+    if REBOOT_ON_RESTART:
+        try: reboot_all_phones()
+        except Exception as e: log(f"shutdown reboot err: {e!r}")
+        time.sleep(1.5)   # give the NOTIFYs time to go out and be ACKed before we exit
+    sys.exit(0)
+
 # ----------------------------- HTTP config/cert server (port 80) -----------------------------
 class QuietHTTP(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a):
@@ -1056,6 +1593,62 @@ def write_phoneconfig():
         open(cu, "w").write('[site]\ndateFormatLong="\\\\a, \\\\b \\\\d \\\\Y"\n'
                             'timeFormatLong="\\\\h:\\\\m\\\\p"\ndateFormatShort="\\\\n/\\\\d/\\\\Y"\n'
                             'timeFormatShort="\\\\h:\\\\m\\\\p"\n')
+
+# The Voicemail key dials "micloud voicemailloginextension", which the firmware only
+# writes from ua-profile subscription data (UaProfSvc::EvUpdated -> PhUaProfMgr::
+# UpdateSvcData). .txt keys, Aastra-style lines and unsolicited ua-profile NOTIFYs all
+# had no effect (tested 2026-11-09). Kept so that if the phone ever SUBSCRIBEs to
+# ua-profile, it gets the voicemail number.
+def ua_profile_body(mac):
+    """[user] block delivered through a ua-profile subscription -> PhUaProfMgr::
+    UpdateSvcData; unknown keys become "micloud <key>" (lowercase is significant)."""
+    lines = ["[user]"]
+    if VM_NUMBER:
+        lines += [f"voicemailloginextension={VM_NUMBER}", f"voicemailextension={VM_NUMBER}"]
+    return "\n".join(lines) + "\n"
+
+def ua_profile_subscribe(conn, mac, hdrs, addr):
+    """Accept the phone's ua-profile SUBSCRIBE, then NOTIFY inside that dialog."""
+    totag = mktag(H(hdrs, "call-id") + "srv")       # same tag p_resp puts on the 200 OK
+    r = p_resp(200, "OK", hdrs, addr, "SUBSCRIBE")
+    conn.sendall(r)
+    time.sleep(0.3)
+    body = ua_profile_body(mac).encode()
+    acc = H(hdrs, "accept").split(",")[0].strip() or "text/plain"
+    ct = uri_of(H(hdrs, "contact")) or CONTACTS.get(mac, "")
+    to_hdr = H(hdrs, "from")                       # their From becomes our To
+    frm = H(hdrs, "to")
+    if ";tag=" not in frm: frm += ";tag=" + totag
+    L = [f"NOTIFY {ct} SIP/2.0", f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)};rport",
+         "Max-Forwards: 70", f"From: {frm}", f"To: {to_hdr}", f"Call-ID: {H(hdrs, 'call-id')}",
+         "CSeq: 1 NOTIFY", f"Event: {H(hdrs, 'event')}", "Subscription-State: active;expires=3600",
+         f"Contact: <sips:switch@{MYIP}:5061;transport=tls>",
+         f"Content-Type: {acc}", f"Content-Length: {len(body)}"]
+    with pinlock: PIN[H(hdrs, "call-id")] = []
+    conn.sendall(("\r\n".join(L) + "\r\n\r\n").encode() + body)
+    end = time.time() + 5; reply = None
+    while time.time() < end and not reply:
+        with pinlock: q = [m for m in PIN.get(H(hdrs, "call-id"), []) if "NOTIFY" in H(parse(m)[1], "cseq")]
+        if q: reply = q[-1]
+        time.sleep(0.05)
+    with pinlock: PIN.pop(H(hdrs, "call-id"), None)
+    log(f"ua-profile NOTIFY to {mac} ({acc}, {len(body)} bytes): "
+        + ((reply or "").split("\r\n")[0] or "no reply"))
+
+# ---- programmable buttons / BB424 (804 firmware p8_phone ProgrammableButtonsDM) ----
+# [progbuttons] holds one value: ';'-separated records, each starting "SK=<n>".
+# n = line+1; line 0-15 = the phone's own keys, 16+24*(box-1)+btn = button box
+# keys, so BB424 #1 buttons 1-24 are SK=17..40 (translateLineToPair). Record:
+# SK=n;label;funcId;target;flag;ringDelay;noConnAction;connAction;stackPos;
+#      target2;papi;longLabel;   (field positions from ProgrammableButtonDM getters;
+# label/longLabel positions inferred). funcId = firmware EnumProgButton codes.
+def p8_extra_blocks(p=None):
+    """Extra pphone.conf keys served per phone. SysConfigDM.voiceMailLoginExtension
+    (exact case) is what the Voicemail key dials -- works. [progbuttons] is intentionally
+    NOT emitted: disassembly + the 2026-11-09 speed-dial test proved the phone builds its
+    8 keys from locally persisted state (not the served file) and never builds a button
+    device for the BB424, so emitting it only risks disturbing the phone's own keys."""
+    return f"[system]\nvoiceMailLoginExtension={VM_NUMBER}\n" if VM_NUMBER else ""
 
 def http_server():
     write_phoneconfig()
@@ -1270,8 +1863,11 @@ def main():
     for p in (CERT, KEY, os.path.join(HTTP_ROOT, "keystore", "certs", "hq_ca.crt")):
         if not os.path.exists(p):
             sys.stderr.write(f"shorebridge: missing {p} (run the installer first)\n"); sys.exit(1)
-    load_phones()
-    log(f"shorebridge starting: bind={MYIP} pbx={SBC_IP}:{SBC_PORT} domain={DOMAIN} phones={len(PHONES)}")
+    load_phones(); load_phone_ips()
+    signal.signal(signal.SIGTERM, _on_shutdown)
+    signal.signal(signal.SIGINT, _on_shutdown)
+    log(f"shorebridge starting: bind={MYIP} pbx={SBC_IP}:{SBC_PORT} domain={DOMAIN} phones={len(PHONES)}"
+        + (f" (reboot phones on restart: when={REBOOT_WHEN})" if REBOOT_ON_RESTART else ""))
     ensure_registrations()
     threading.Thread(target=refresh_catalog, daemon=True).start()
     threading.Thread(target=http_server, daemon=True).start()

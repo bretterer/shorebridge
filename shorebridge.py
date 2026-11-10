@@ -275,6 +275,124 @@ def sdp_media(sdp):
         if line.startswith("m=audio") and port is None: port = int(line.split()[1])
     return (ip, port) if ip and port else None
 
+_MIRROR = {"sendonly": "recvonly", "recvonly": "sendonly", "inactive": "inactive", "sendrecv": "sendrecv"}
+def sdp_dir(sdp):
+    """Direction of the first audio m-section of an offer (c=0.0.0.0 = old-style hold)."""
+    d = "sendrecv"; in_audio = False; seen = False
+    for line in (sdp or "").split("\n"):
+        line = line.strip()
+        if line.startswith("m="):
+            if seen: break
+            in_audio = line.startswith("m=audio"); seen = seen or in_audio
+        elif line.startswith("c=IN IP4 0.0.0.0"): d = "inactive"
+        elif in_audio and line[2:] in _MIRROR and line.startswith("a="): d = line[2:]
+    return d
+def _next_ver(cs):
+    cs.sdp_ver = getattr(cs, "sdp_ver", 1) + 1; return cs.sdp_ver
+def reinvite_answer(cs, offer, leg):
+    """Answer SDP for a re-INVITE on leg 'phone' or 'pbx', same m-line count as the offer."""
+    d = _MIRROR.get(sdp_dir(offer), "sendrecv"); v = _next_ver(cs)
+    nm = max(1, sum(1 for l in (offer or "").split("\n") if l.startswith("m=")))
+    if leg == "phone":
+        sdp = ("v=0\r\n" f"o=switch 1 {v} IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
+               f"m=audio {cs.rpP} RTP/AVP 0 {cs.phone_te}\r\n" "a=rtpmap:0 PCMU/8000\r\n"
+               f"a=rtpmap:{cs.phone_te} telephone-event/8000\r\n" "a=ptime:20\r\n" f"a={d}\r\n")
+        sdp += "m=audio 0 RTP/SAVP 0\r\n" * (nm - 1)
+    else:
+        sdp = ("v=0\r\n" f"o=bridge 1 {v} IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
+               f"m=audio {cs.rp3} RTP/AVP 0 {cs.pbx_te}\r\n" "a=rtpmap:0 PCMU/8000\r\n"
+               f"a=rtpmap:{cs.pbx_te} telephone-event/8000\r\n" f"a={d}\r\n")
+        sdp += "m=audio 0 RTP/AVP 0\r\n" * (nm - 1)
+    return sdp, d
+
+def phone_reinvite(conn, cs, hdrs, body, addr):
+    m = sdp_media(body)
+    if m and m[1] and m[0] != "0.0.0.0": cs.phone_rtp = m
+    ans, d = reinvite_answer(cs, body, "phone")
+    conn.sendall(p_resp(200, "OK", hdrs, addr, "INVITE", sdp=ans))
+    pd = sdp_dir(body)
+    log(f"phone re-INVITE on {cs.dst}: {pd} -> answered {d}"
+        + (" (hold)" if d in ("recvonly", "inactive") else ""))
+    # Pass hold/resume on to the PBX so it plays its music-on-hold to the far end.
+    # Skip pure session-timer refreshes (direction unchanged).
+    if pd != getattr(cs, "x_dir", "sendrecv"):
+        threading.Thread(target=x_reinvite, args=(cs, pd), daemon=True).start()
+
+def x_reinvite(cs, direction):
+    """In-dialog re-INVITE to the PBX leg offering `direction` (sendonly = hold,
+    sendrecv = resume). Handles one digest challenge, ACKs the 2xx."""
+    leg = cs.x_dialog
+    if not leg: return
+    with pstate: creds = creds_for_mac(cs.mac)
+    authid, password = (creds[1], creds[2]) if creds else (cs.authid, cs.password)
+    v = _next_ver(cs)
+    sdp = ("v=0\r\n" f"o=bridge 1 {v} IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
+           f"m=audio {cs.rp3} RTP/AVP 0 {cs.pbx_te}\r\n" "a=rtpmap:0 PCMU/8000\r\n"
+           f"a=rtpmap:{cs.pbx_te} telephone-event/8000\r\n" f"a={direction}\r\n").encode()
+    def mk(cseq, branch, auth=None, hdr="Proxy-Authorization"):
+        L = [f"INVITE {leg['ruri']} SIP/2.0",
+             f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch={branch};rport"]
+        L += [f"Route: {rt}" for rt in leg.get("route", [])]
+        L += ["Max-Forwards: 70", f"From: {leg['local']};tag={leg['ltag']}", f"To: {leg['remote']}",
+              f"Call-ID: {leg['callid']}", f"CSeq: {cseq} INVITE",
+              f"Contact: <sip:{cs.ext}@{MYIP}:{P3CX}>", "User-Agent: ShoreBridge/1.0"]
+        if auth: L.append(f"{hdr}: {auth}")
+        L += ["Content-Type: application/sdp", f"Content-Length: {len(sdp)}"]
+        return ("\r\n".join(L) + "\r\n\r\n").encode() + sdp
+    def ack(cseq, resp, branch):
+        # non-2xx ACK reuses the INVITE's branch (same transaction); 2xx ACK gets a new one
+        _, h, _ = parse(resp)
+        if resp.split("\r\n")[0].split()[1].startswith("2"): branch = "z9hG4bK" + rid(16)
+        L = [f"ACK {leg['ruri']} SIP/2.0", f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch={branch};rport"]
+        L += [f"Route: {rt}" for rt in leg.get("route", [])]
+        L += ["Max-Forwards: 70", f"From: {leg['local']};tag={leg['ltag']}", f"To: {H(h,'to') or leg['remote']}",
+              f"Call-ID: {leg['callid']}", f"CSeq: {cseq} ACK", "Content-Length: 0"]
+        u3.sendto(("\r\n".join(L) + "\r\n\r\n").encode(), SBC)
+    leg["cseq"] = leg.get("cseq", 1) + 1; cseq = leg["cseq"]
+    br = "z9hG4bK" + rid(16)
+    with wlock: waiters[leg["callid"]] = []
+    u3.sendto(mk(cseq, br), SBC)
+    r = wait_invite(leg["callid"], 6, cseq=cseq)
+    if r and r.split("\r\n")[0].split()[1] in ("401", "407"):
+        st = r.split("\r\n")[0]; ack(cseq, r, br)
+        hh = [l for l in r.split("\r\n") if l.lower().startswith(("www-authenticate", "proxy-authenticate"))]
+        realm, nonce, qop, opaque = parse_auth(hh[0])
+        hdr = "Proxy-Authorization" if " 407 " in st else "Authorization"
+        auth = digest("INVITE", leg["ruri"], realm, nonce, qop, rid(16), "00000001", opaque, authid, password)
+        leg["cseq"] += 1; cseq = leg["cseq"]; br = "z9hG4bK" + rid(16)
+        with wlock: waiters[leg["callid"]] = []
+        u3.sendto(mk(cseq, br, auth, hdr), SBC)
+        r = wait_invite(leg["callid"], 6, cseq=cseq)
+    code = r.split("\r\n")[0].split()[1] if r else "timeout"
+    if DEBUG:
+        dbg("PBX re-INVITE SENT >>>>\n" + mk(cseq, br).decode("utf-8", "replace").strip() + "\n<<<< end")
+        dbg("PBX re-INVITE REPLY >>>>\n" + (r or "(none)").strip() + "\n<<<< end")
+    if r and code.isdigit() and int(code) >= 200: ack(cseq, r, br)
+    if code == "200":
+        _, _, rb = parse(r); m = sdp_media(rb)
+        if m and m[1] and m[0] != "0.0.0.0": cs.x_rtp = m
+        cs.x_dir = direction
+    log(f"PBX re-INVITE {direction} on {cs.dst}: {code}" + (" (hold music from PBX)" if direction != "sendrecv" and code == "200" else ""))
+
+def pbx_reinvite(cs, xh, xraw, xaddr):
+    _, _, xbody = parse(xraw)
+    m = sdp_media(xbody)
+    if m and m[1] and m[0] != "0.0.0.0": cs.x_rtp = m
+    to = H(xh, "to")
+    # (an offer-less re-INVITE gets our sendrecv offer here; its answer comes in the ACK)
+    ans, d = reinvite_answer(cs, xbody, "pbx"); ob = ans.encode()
+    extra = ["Content-Type: application/sdp", f"Content-Length: {len(ob)}"]
+    L = ["SIP/2.0 200 OK"] + allvia(xh) + allrr(xh) + [f"From: {H(xh,'from')}", f"To: {to}",
+         f"Call-ID: {H(xh,'call-id')}", f"CSeq: {H(xh,'cseq')}",
+         f"Contact: <sip:{cs.ext}@{MYIP}:{P3CX}>"] + extra
+    u3.sendto(("\r\n".join(L) + "\r\n\r\n").encode() + ob, xaddr)
+    log(f"PBX re-INVITE on {cs.dst}: {sdp_dir(xbody)} -> answered {d}")
+
+def sdp_te_pt(sdp):
+    """Payload type the SDP assigns to telephone-event (RFC 4733 DTMF), or None."""
+    m = re.search(r"a=rtpmap:(\d+)\s+telephone-event/", sdp or "", re.I)
+    return int(m.group(1)) if m else None
+
 class CallSession:
     def __init__(s, dst, conn, mac, ext, authid, password):
         s.dst = dst; s.pc = conn; s.mac = mac
@@ -285,6 +403,8 @@ class CallSession:
         s.phone_rtp = None; s.x_rtp = None
         s.alive = True; s.p_ftag = None; s.p_totag = None; s.p_addr = None
         s.p_dialog = None; s.x_dialog = None; s.p_inv = None
+        s.t_start = time.time(); s.t_up = None; s.direction = "out"; s.peer = dst
+        s.phone_te = 102; s.pbx_te = 101      # DTMF payload types negotiated on each leg
     def on_3cx_response(s, msg): pass
     def on_3cx_request(s, method, hdrs, msg):
         if method in ("BYE", "CANCEL"): s.teardown(origin="3cx")
@@ -299,6 +419,14 @@ class CallSession:
             for so in r:
                 try: d, a = so.recvfrom(4096)
                 except Exception: continue
+                # DTMF (telephone-event) uses a different payload-type number on each
+                # leg; relabel it or the far end drops the digits.
+                if len(d) >= 12 and (d[0] >> 6) == 2:
+                    pt = d[1] & 0x7F
+                    if so is s.sockP and pt == s.phone_te and s.pbx_te != s.phone_te:
+                        d = d[:1] + bytes([(d[1] & 0x80) | s.pbx_te]) + d[2:]
+                    elif so is s.sock3 and pt == s.pbx_te and s.pbx_te != s.phone_te:
+                        d = d[:1] + bytes([(d[1] & 0x80) | s.phone_te]) + d[2:]
                 if so is s.sockP:
                     s.phone_rtp = a; np_ += 1
                     if s.x_rtp:
@@ -446,6 +574,7 @@ def phone_invite(conn, mac, hdrs, body, addr):
         log(f"PBX rejected: {r.splitlines()[0]}")
         conn.sendall(p_resp(code if code < 700 else 486, "Declined", hdrs, addr, "INVITE")); cs.teardown(); return
     _, xh, xb = parse(r); cs.x_rtp = sdp_media(xb); cs.x_totag = H(xh, "to"); x_ack_ok(r, cs)
+    cs.pbx_te = sdp_te_pt(xb) or 101; cs.phone_te = sdp_te_pt(body) or 102
     cs.x_dialog = {'ruri': uri_of(H(xh, "contact")) or f"sip:{dst}@{DOMAIN}", 'transport': 'UDP', 'lport': P3CX,
                    'local': f"<sip:{ext}@{DOMAIN}>", 'ltag': cs.x_ftag, 'remote': H(xh, "to"),
                    'callid': cs.x_callid, 'route': list(reversed(xh.get("record-route", []))), 'cseq': 2}
@@ -454,7 +583,7 @@ def phone_invite(conn, mac, hdrs, body, addr):
                    'callid': cs.p_callid, 'route': [], 'cseq': 1, 'conn': conn}
     threading.Thread(target=cs.relay, daemon=True).start()
     ans = ("v=0\r\n" f"o=switch 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
-           f"m=audio {cs.rpP} RTP/AVP 0 102\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:102 telephone-event/8000\r\n" "a=ptime:20\r\n" "a=sendrecv\r\n"
+           f"m=audio {cs.rpP} RTP/AVP 0 {cs.phone_te}\r\n" "a=rtpmap:0 PCMU/8000\r\n" f"a=rtpmap:{cs.phone_te} telephone-event/8000\r\n" "a=ptime:20\r\n" "a=sendrecv\r\n"
            "m=audio 0 RTP/SAVP 0\r\n")
     conn.sendall(p_resp(200, "OK", hdrs, addr, "INVITE", sdp=ans))
     log(f"call up: ext {ext} <-> {dst}")
@@ -843,7 +972,8 @@ def inbound_invite(xh, xraw, xaddr):
         log(f"inbound for ext {ext}: no phone online"); u3.sendto(resp_line(480, "Unavailable", xh).encode(), xaddr); return
     fm = re.search(r'sips?:([^@>;]+)', H(xh, "from")); caller = fm.group(1) if fm else "unknown"
     cs = CallSession("inbound", conn, mac, ext, "", "")
-    cs.x_callid = H(xh, "call-id"); cs.x_rtp = sdp_media(xbody)
+    cs.direction = "in"; cs.peer = caller
+    cs.x_callid = H(xh, "call-id"); cs.x_rtp = sdp_media(xbody); cs.pbx_te = sdp_te_pt(xbody) or 101
     cs.p_callid = rid(16) + "@" + MYIP; cs.p_ftag = rid(8)
     CALLS[cs.x_callid] = cs; CALLS[cs.p_callid] = cs
     with pstate:
@@ -891,6 +1021,7 @@ def inbound_invite(xh, xraw, xaddr):
     if code >= 300:
         u3.sendto(resp_line(486, "Busy Here", xh).encode(), xaddr); cs.teardown(); return
     _, ph, pb = parse(final); cs.phone_rtp = sdp_media(pb); cs.p_totag = H(ph, "to")
+    cs.phone_te = sdp_te_pt(pb) or 102
     ack = ("\r\n".join([
         f"ACK {phone_uri} SIP/2.0", f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)}",
         "Max-Forwards: 70", f"From: <sips:{caller}@{MYIP}>;tag={cs.p_ftag}", f"To: {cs.p_totag}",
@@ -899,7 +1030,7 @@ def inbound_invite(xh, xraw, xaddr):
     except Exception: pass
     threading.Thread(target=cs.relay, daemon=True).start()
     osdp = ("v=0\r\n" f"o=bridge 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
-            f"m=audio {cs.rp3} RTP/AVP 0 101\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:101 telephone-event/8000\r\n" "a=sendrecv\r\n")
+            f"m=audio {cs.rp3} RTP/AVP 0 {cs.pbx_te}\r\n" "a=rtpmap:0 PCMU/8000\r\n" f"a=rtpmap:{cs.pbx_te} telephone-event/8000\r\n" "a=sendrecv\r\n")
     ob = osdp.encode(); to2 = H(xh, "to")
     if ";tag=" not in to2: to2 = to2 + ";tag=" + mktag(cs.x_callid + "in")
     L = [f"SIP/2.0 200 OK"] + allvia(xh) + allrr(xh) + [f"From: {H(xh,'from')}", f"To: {to2}",

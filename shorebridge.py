@@ -18,8 +18,8 @@ connection; per-phone credentials are never in config.ini.
 
 Single process, Python standard library only.
 """
-import socket, ssl, threading, hashlib, random, time, re, os, sys, json, configparser
-import http.server, socketserver, functools
+import socket, ssl, threading, hashlib, random, time, re, os, sys, json, configparser, signal
+import http.server, socketserver, functools, html
 from urllib.parse import parse_qs, urlparse
 import connectors
 
@@ -121,6 +121,8 @@ def creds_for_mac(mac):
 def mac_for_ext(ext):
     for mac, p in PHONES.items():
         if p["extension"] == ext: return mac
+    return None
+
 def mac_for_ip(ip):
     """Reverse the MAC->IP map (populated at REGISTER). Lets an INVITE that arrives on a
     TLS connection before this phone has REGISTERed on it still be identified, e.g. a
@@ -388,7 +390,10 @@ def resp_line(code, reason, hdrs):
 
 # ----------------------------- RTP relay -----------------------------
 def alloc_rtp():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # No SO_REUSEADDR here: on Linux it lets two UDP sockets bind the SAME port, so the
+    # phone-side and PBX-side sockets of a call collided and the phone's audio was
+    # looped back to the phone instead of reaching the PBX (one-way audio).
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     for p in range(12000, 12800, 2):
         try: s.bind((MYIP, p)); return s, p
         except OSError: continue
@@ -403,6 +408,7 @@ def sdp_media(sdp):
     return (ip, port) if ip and port else None
 
 # ----------------------------- call log (for the phone's History) -----------------------------
+CALLS_JSON = os.path.join(DATA, "calls.json")
 HISTORY_FMT_JSON = os.path.join(DATA, "history_format.json")
 CALLLOG_LOCK = threading.Lock()
 CALLLOG_MAX = 200
@@ -478,6 +484,7 @@ def record_call(cs):
 # they (and the ts-start unit) are read from history_format.json on every request.
 HIST_HDR  = ["recid", "rec-type", "ts-start", "duration-secs", "time-label", "secure",
              "call-recording-flag", "parties"]
+PARTY_HDR = ["name", "number", "number-canonical"]
 HISTORY_FMT_DEFAULT = {"rec_type": {"in": 1, "out": 2, "missed": 3}, "ts_units": "s", "time_label": 0}
 
 def _canon(num):
@@ -842,7 +849,9 @@ def phone_invite(conn, mac, hdrs, body, addr):
            f"m=audio {cs.rpP} RTP/AVP 0 {cs.phone_te}\r\n" "a=rtpmap:0 PCMU/8000\r\n" f"a=rtpmap:{cs.phone_te} telephone-event/8000\r\n" "a=ptime:20\r\n" "a=sendrecv\r\n"
            "m=audio 0 RTP/SAVP 0\r\n")
     conn.sendall(p_resp(200, "OK", hdrs, addr, "INVITE", sdp=ans))
+    cs.t_up = time.time()
     log(f"call up: ext {ext} <-> {dst}")
+
 PHONE_IPS_JSON = os.path.join(DATA, "phone_ips.json")
 def save_phone_ips():
     """Persist MAC -> last IP so that right after a bridge restart CAS can still tell
@@ -1115,6 +1124,61 @@ def cas_pin(msg, req, ext):
     log(f"CAS set-tui-pwd {mac}: PIN changed from the phone")
     return {**ok, "results": {}}
 
+def cas_set_prog_buttons(req, ext):
+    """Phone's Options > Programmable Keys: store the button(s) in the phone's layout
+    (columnar CAS rows) and regenerate its config so it survives the next reload."""
+    rid_ = req.get("request-id", 0)
+    ok = {"request-id": rid_, "topic": "config", "message": "set-prog-buttons", "response": 0,
+          "error": 0, "results": {}}
+    mac = mac_for_ext(ext) if ext else None
+    rows = req.get("buttons") or []
+    if not mac or not rows or not isinstance(rows[0], list):
+        log(f"CAS set-prog-buttons: {'unidentified phone' if not mac else 'no rows'}"); return ok
+    hdr = rows[0]; saved = []
+    for r in rows[1:]:
+        f = dict(zip(hdr, r))
+        try: num = int(f.get("button-num", 0))
+        except Exception: continue
+        if num < 1: continue
+        if f.get("btn-box"):
+            try: box = max(1, int(f.get("dev-order", 1)))
+            except Exception: box = 1
+            sk = bb_sk(box, num)
+        else:
+            sk = num
+        try: func = int(f.get("func-id", 1))
+        except Exception: func = 1
+        with pstate:
+            btns = PHONES.get(mac, {}).setdefault("buttons", {})
+            if func in (0, 1): btns.pop(str(sk), None)
+            else:
+                btns[str(sk)] = {"func": func, "target": str(f.get("target", "")),
+                                 "target2": str(f.get("target2", "")),
+                                 "label": str(f.get("label") or f.get("long-label") or ""),
+                                 "long": str(f.get("long-label") or f.get("label") or "")}
+        saved.append(f"SK={sk} {PROG_FUNC_NAMES.get(func, func)} {f.get('target', '')}")
+    save_phones()
+    try: write_phoneconfig()
+    except Exception as e: log(f"phoneconfig rewrite failed: {e!r}")
+    log(f"CAS set-prog-buttons {mac}: stored {', '.join(saved) or 'nothing'} (the phone keeps it locally; bridge only records it)")
+    return ok
+
+CAS_OVERRIDES_JSON = os.path.join(DATA, "cas_overrides.json")
+def cas_override(topic, msg, rid_):
+    """Reply for "<topic>/<message>" from cas_overrides.json, re-read on every request
+    so reply shapes can be tried without a restart. "$rid" is replaced by the
+    request-id. No file / no entry -> None (normal handling)."""
+    try:
+        with open(CAS_OVERRIDES_JSON) as f: table = json.load(f)
+    except Exception: return None
+    tpl = table.get(f"{topic}/{msg}")
+    if not isinstance(tpl, dict): return None
+    def fill(v):
+        if isinstance(v, dict): return {k: fill(x) for k, x in v.items()}
+        if isinstance(v, list): return [fill(x) for x in v]
+        return rid_ if v == "$rid" else v
+    return fill(tpl)
+
 def _session_ok(target):
     sid = parse_qs(urlparse(target).query).get("SessionId", [""])[0]
     with CAS_LOCK:
@@ -1166,6 +1230,14 @@ def cas_dispatch(method, target, body, client_ip=""):
         topic, msg = req.get("topic"), req.get("message")
         rid_ = req.get("request-id", 0)
         log(f"CAS Execute topic={topic} message={msg}")
+        if topic == "config" and msg in ("authenticate-tui-pwd", "set-tui-pwd"):
+            return cas_pin(msg, req, ext)
+        if topic == "config" and msg == "set-prog-buttons":
+            return cas_set_prog_buttons(req, ext)
+        ov = cas_override(topic, msg, rid_)       # hot-editable reply (cas_overrides.json)
+        if ov is not None:
+            log(f"CAS {topic}/{msg} -> override reply: {json.dumps(ov)[:300]}")
+            return ov
         if topic == "find":
             return cas_find_response(req)
         if topic == "tel" and msg == "reset-missed-call-count":
@@ -1274,8 +1346,10 @@ def cas_handle(conn, addr):
                 b"Content-Length: %d\r\nConnection: %s\r\n\r\n%s"
                 % (len(payload), b"keep-alive" if keep else b"close", payload))
             if not keep: break
+    except (ConnectionResetError, BrokenPipeError, socket.timeout, ssl.SSLError) as e:
+        if DEBUG: log("CAS err " + repr(e))         # phone hung up / long-poll ended: normal
     except Exception as e:
-        if DEBUG: log("CAS err " + repr(e))
+        log("CAS err " + repr(e))                   # real handler bug: always log
     finally:
         try: conn.close()
         except Exception: pass
@@ -1391,6 +1465,7 @@ def inbound_invite(xh, xraw, xaddr):
     cs.p_dialog = {'ruri': phone_uri, 'transport': 'TLS', 'lport': 5061,
                    'local': f"<sips:{caller}@{MYIP}>", 'ltag': cs.p_ftag, 'remote': cs.p_totag,
                    'callid': cs.p_callid, 'route': [], 'cseq': 1, 'conn': conn}
+    cs.t_up = time.time()
     log(f"inbound call up: {caller} <-> ext {ext}")
 
 def xaddr_ip(conn):
@@ -1573,7 +1648,7 @@ def write_phoneconfig():
         first, last = _split_name(label or ext or "")
         b = "[user]\n"
         if with_tz: b += f"timezone={TZ}\n"
-        return b + f"userFirstName={first}\nuserLastName={last}\n"
+        return b + f"userFirstName={first}\nuserLastName={last}\nallowPhoneButtonCustomization=true\n"
     one_ext = one_label = ""
     if len(PHONES) == 1:
         _one = next(iter(PHONES.values()))
@@ -1581,13 +1656,18 @@ def write_phoneconfig():
         one_label = _one.get("label", "")
     open(os.path.join(d, "custom.txt"), "w").write(
         sip_block(one_ext) + cas_block + user_block(one_label, one_ext, with_tz=True))
+    # Per-MODEL config layer. The phone fetches custom_<MODEL>.txt (e.g. custom_IP485g.txt)
+    # between custom.txt and custom_<MAC>.txt (seen in a 2026-11-10 capture -- we were
+    # 404ing it). Serve the common sip/cas base + button customization so the layer exists.
+    open(os.path.join(d, "custom_IP485g.txt"), "w").write(
+        sip_block() + cas_block + "[user]\nallowPhoneButtonCustomization=true\n")
     # Per-MAC config (fetched as custom_<MAC>.txt after custom.txt) sets each phone's
     # own sipExtension and display name.
     for mac, p in list(PHONES.items()):
         ext = str(p.get("extension", "")).strip()
         if not ext: continue
         open(os.path.join(d, f"custom_{mac.upper()}.txt"), "w").write(
-            sip_block(ext) + user_block(p.get("label", ""), ext))
+            sip_block(ext) + user_block(p.get("label", ""), ext) + p8_extra_blocks(p))
     cu = os.path.join(d, "country_US.txt")
     if not os.path.exists(cu):
         open(cu, "w").write('[site]\ndateFormatLong="\\\\a, \\\\b \\\\d \\\\Y"\n'
@@ -1642,6 +1722,42 @@ def ua_profile_subscribe(conn, mac, hdrs, addr):
 # SK=n;label;funcId;target;flag;ringDelay;noConnAction;connAction;stackPos;
 #      target2;papi;longLabel;   (field positions from ProgrammableButtonDM getters;
 # label/longLabel positions inferred). funcId = firmware EnumProgButton codes.
+PROG_FUNCS = [(1, "Unused"), (4, "Dial Number"), (5, "Dial Mailbox"), (2, "Call Appearance"),
+              (3, "Monitor Extension"), (6, "Intercom"), (10, "Pickup"), (11, "Unpark"),
+              (14, "Page"), (15, "Transfer Blind"), (16, "Transfer Consultative"),
+              (17, "Transfer To Mailbox"), (19, "Conference Blind"), (20, "Conference Consultative"),
+              (22, "Park"), (27, "Send Digits Over Call"), (60, "Toggle Handsfree"),
+              (87, "Lock/Unlock")]
+PROG_FUNC_NAMES = dict(PROG_FUNCS)
+BB_BUTTONS = 24
+PHONE_KEYS = 8                  # P8CGPhoneClr::populateProgrammableButtons builds 8 phone keys
+def bb_sk(box, btn):            # box 1-based, btn 1-based  -> SK index (after the phone's keys)
+    return PHONE_KEYS + BB_BUTTONS * (box - 1) + btn
+def _clean(v, n=32):             # no record/field separators inside values
+    return re.sub(r"[;\r\n]|SK=", "", str(v or ""))[:n]
+
+def progbuttons_block(p):
+    # NOT emitted. DISPROVEN 2026-11-09 by the speed-dial experiment + disassembly:
+    #  - The config loader path is ProgrammableButtonsDM::set(QSettings*) -> the single
+    #    call to configureDeviceButtons. It configures exactly ONE device.
+    #  - populateProgrammableButtons is the ONLY site that constructs a
+    #    ProgrammableButtonDeviceDM, and it builds ONE device of 8 buttons from locally
+    #    persisted state -- so even device 0 ignores the served [progbuttons] on reboot
+    #    (a phone-key speed dial written to custom_<MAC>.txt did NOT appear).
+    # The phone owns its button state locally and reports changes up via config::
+    # set-prog-buttons; the BB424 is never built as a button device from any served config.
+    # Kept only to render the stored layout if a live push path is ever found.
+    btns = dict(p.get("buttons") or {})
+    recs = []
+    for sk in sorted(btns, key=lambda k: int(k)):
+        b = btns[sk]
+        try: func = int(b.get("func", 1))
+        except Exception: func = 1
+        lab = _clean(b.get("label"), 16); lng = _clean(b.get("long") or b.get("label"), 32)
+        recs.append(";".join([f"SK={int(sk)}", lab, str(func), _clean(b.get("target"), 40), "0", "-1",
+                              "0", "0", "0", _clean(b.get("target2"), 40), "", lng, ""]))
+    return (f"[progbuttons]\nbboxCount=1\nbuttons=" + ";".join(recs) + "\n") if recs else ""
+
 def p8_extra_blocks(p=None):
     """Extra pphone.conf keys served per phone. SysConfigDM.voiceMailLoginExtension
     (exact case) is what the Voicemail key dials -- works. [progbuttons] is intentionally
@@ -1659,38 +1775,70 @@ def http_server():
     httpd.serve_forever()
 
 # ----------------------------- admin web UI (port UI_PORT) -----------------------------
-PAGE = """<!doctype html><html><head><meta charset=utf-8><title>shorebridge</title>
-<style>
-body{{font:15px system-ui,sans-serif;margin:2rem;max-width:820px;color:#222}}
-h1{{font-size:1.4rem}} h2{{font-size:1.05rem;margin-top:1.8rem;color:#444}}
-table{{border-collapse:collapse;width:100%}} td,th{{padding:.45rem .6rem;border-bottom:1px solid #eee;text-align:left}}
-.on{{color:#0a0;font-weight:600}} .off{{color:#999}}
-input{{padding:.35rem;border:1px solid #ccc;border-radius:4px}}
-button{{padding:.35rem .8rem;border:0;border-radius:4px;background:#2563eb;color:#fff;cursor:pointer}}
-button.d{{background:#ddd;color:#333}}
-.card{{background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:1rem;margin:.6rem 0}}
-small{{color:#888}}
-</style></head><body>
-<h1>shorebridge <small>{ip}</small> <a href=/ style="font-size:.8rem;font-weight:400">&#8635; refresh</a></h1>
-<p><small>{connstatus}</small></p>
+CSS = """
+:root{{--bg:#f1f5f9;--card:#fff;--ink:#1e293b;--muted:#64748b;--line:#e2e8f0;--blue:#2563eb}}
+*{{box-sizing:border-box}}
+body{{font:15px system-ui,sans-serif;margin:0;background:var(--bg);color:var(--ink)}}
+.wrap{{max-width:900px;margin:0 auto;padding:1.5rem}}
+h1{{font-size:1.3rem;margin:0}} h2{{font-size:1.02rem;margin:1.4rem 0 .5rem;color:var(--ink)}}
+a{{color:var(--blue)}} small{{color:var(--muted)}}
+table{{border-collapse:collapse;width:100%;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}}
+td,th{{padding:.5rem .7rem;border-bottom:1px solid var(--line);text-align:left}}
+tr:last-child td{{border-bottom:0}}
+th{{background:#f8fafc;font-size:.8rem;text-transform:uppercase;letter-spacing:.03em;color:var(--muted)}}
+.on{{color:#16a34a;font-weight:600}} .off{{color:#94a3b8}}
+input,select{{padding:.4rem;border:1px solid #cbd5e1;border-radius:6px;font:inherit}}
+button{{padding:.4rem .85rem;border:0;border-radius:6px;background:var(--blue);color:#fff;cursor:pointer;font:inherit}}
+button.d{{background:#e2e8f0;color:#334155}} button.ghost{{background:#eef2ff;color:var(--blue)}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:1rem;margin:.7rem 0}}
+.card table,.card tr:last-child td{{border:0}} .card td{{border-bottom:0;padding:.3rem .4rem}}
+.bar{{display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;margin-bottom:.3rem}}
+.status{{color:var(--muted);font-size:.9rem;margin:.2rem 0 1rem}}
+.tabbar{{display:flex;gap:.3rem;border-bottom:2px solid var(--line);margin-bottom:1rem;flex-wrap:wrap}}
+.tabbar button{{background:none;color:var(--muted);border-radius:8px 8px 0 0;padding:.5rem 1rem;font-weight:600;border-bottom:2px solid transparent;margin-bottom:-2px}}
+.tabbar button.active{{color:var(--blue);border-bottom-color:var(--blue)}}
+"""
+PAGE = ("""<!doctype html><html><head><meta charset=utf-8><title>shorebridge</title>
+<style>""" + CSS + """</style></head><body><div class=wrap>
+<div class=bar><h1>shorebridge <small>{ip}</small></h1><a href=/>&#8635; refresh</a></div>
+<p class=status>{connstatus}</p>
+<div class=tabbar>
+<button data-t=phones>Phones</button>
+<button data-t=calls>Recent calls</button>
+<button data-t=dir>Directory</button>
+</div>
+
+<section class=tab id=tab-phones>
 <h2>Configured phones</h2>
 <table><tr><th>MAC</th><th>Extension</th><th>Label</th><th>Online</th><th>Registered</th><th></th></tr>
 {rows}
 </table>
 {discovered}
-<h2>Add / update a phone</h2>
+<h2 id=phoneform>{formtitle}</h2>
 <form method=post action=/add class=card>
+<input type=hidden name=orig_mac value="{orig_mac}">
 <table>
 <tr><td>MAC</td><td><input name=mac value="{addmac}" placeholder="00:10:49:54:3b:4c" required></td></tr>
 {catalog}
-<tr><td>Extension</td><td><input name=extension placeholder="number"></td></tr>
-<tr><td>Auth ID</td><td><input name=auth_id placeholder="(blank = same as extension)"></td></tr>
-<tr><td>Password</td><td><input name=password type=password></td></tr>
-<tr><td>Label / name</td><td><input name=label placeholder="Front desk"></td></tr>
+<tr><td>Extension</td><td><input name=extension value="{ext_val}" placeholder="number"></td></tr>
+<tr><td>Auth ID</td><td><input name=auth_id value="{auth_val}" placeholder="(blank = same as extension)"></td></tr>
+<tr><td>Password</td><td><input name=password type=password placeholder="{pw_hint}"></td></tr>
+<tr><td>Label / name</td><td><input name=label value="{label_val}" placeholder="Front desk"></td></tr>
+<tr><td>Options PIN</td><td><input name=tui_pin type=password inputmode=numeric pattern="[0-9]*" placeholder="{pin_hint}">
+<label style="margin-left:.6rem"><input type=checkbox name=tui_pin_clear value=1> clear PIN</label></td></tr>
 </table>
-<p><button type=submit>Save phone</button></p>
+<p><button type=submit>Save phone</button> {cancel}</p>
 </form>
+</section>
 
+<section class=tab id=tab-calls hidden>
+<h2>Recent calls <small>(served to the phones' History)</small></h2>
+<table><tr><th>When</th><th></th><th>Number</th><th>Name</th><th>Ext</th><th>Duration</th></tr>
+{calls}
+</table>
+</section>
+
+<section class=tab id=tab-dir hidden>
 <h2>Directory contacts <small>(name + number only, no phone)</small></h2>
 <table><tr><th>Name</th><th>Number</th><th>Type</th><th></th></tr>
 {directory}
@@ -1706,8 +1854,23 @@ small{{color:#888}}
 </table>
 <p><button type=submit>Add contact</button></p>
 </form>
-<p><small>Shown in every phone's Directory alongside registered phones. Edits apply immediately. Config: {cfg}</small></p>
+<p><small>Shown in every phone's Directory alongside registered phones. Edits apply immediately.</small></p>
+</section>
+
+<p class=status>Config: {cfg}</p>
+</div>
 <script>
+function showTab(id){{
+  document.querySelectorAll('.tab').forEach(function(s){{s.hidden=(s.id!='tab-'+id);}});
+  document.querySelectorAll('.tabbar button').forEach(function(b){{b.classList.toggle('active',b.dataset.t==id);}});
+  try{{localStorage.setItem('sb_tab',id);}}catch(e){{}}
+}}
+(function(){{
+  var t='phones';
+  if(!/[?&](edit|add)=/.test(location.search)){{try{{t=localStorage.getItem('sb_tab')||'phones';}}catch(e){{}}}}
+  showTab(t);
+}})();
+document.querySelectorAll('.tabbar button').forEach(function(b){{b.addEventListener('click',function(){{showTab(b.dataset.t);}});}});
 // auto-refresh to surface newly-seen phones, but never while you're typing in a field
 setInterval(function(){{
   var a=document.activeElement;
@@ -1715,7 +1878,7 @@ setInterval(function(){{
   location.reload();
 }}, 8000);
 </script>
-</body></html>"""
+</body></html>""")
 
 def render():
     with pstate:
@@ -1724,10 +1887,18 @@ def render():
             online = mac in CONNS
             reg = REGOK.get(p["extension"], False)
             rows.append(
-                f"<tr><td><code>{mac}</code></td><td>{p['extension']}</td><td>{p.get('label','')}</td>"
+                f"<tr><td><code>{mac}</code></td><td>{html.escape(str(p['extension']))}</td>"
+                f"<td>{html.escape(p.get('label',''))}</td>"
                 f"<td class={'on' if online else 'off'}>{'online' if online else 'offline'}</td>"
                 f"<td class={'on' if reg else 'off'}>{'yes' if reg else 'no'}</td>"
-                f"<td><form method=post action=/delete style=margin:0>"
+                f"<td style=white-space:nowrap><form method=get style='display:inline;margin:0'>"
+                f"<input type=hidden name=edit value='{mac}'><button>edit</button></form> "
+                f"<form method=get action=/buttons style='display:inline;margin:0'>"
+                f"<input type=hidden name=mac value='{mac}'><button>BB424</button></form> "
+                + (f"<form method=post action=/reboot style='display:inline;margin:0' "
+                   f"onsubmit=\"return confirm('Reboot this phone? It will drop any active call and take ~1-2 min.')\">"
+                   f"<input type=hidden name=mac value='{mac}'><button class=ghost>reboot</button></form> " if online else "")
+                + f"<form method=post action=/delete style='display:inline;margin:0'>"
                 f"<input type=hidden name=mac value='{mac}'><button class=d>remove</button></form></td></tr>")
         seen = {m: v for m, v in SEEN.items() if m not in PHONES}
     rowhtml = "".join(rows) or "<tr><td colspan=6><small>none yet</small></td></tr>"
@@ -1762,15 +1933,99 @@ def render():
 class AdminHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         if DEBUG: super().log_message(*a)
-    def _page(self, addmac=""):
+    def _page(self, addmac="", edit=""):
         rowhtml, disc, catalog, connstatus, dirhtml = render()
-        html = PAGE.format(ip=MYIP, rows=rowhtml, discovered=disc, addmac=addmac,
-                           cfg=PHONES_JSON, catalog=catalog, connstatus=connstatus, directory=dirhtml)
+        e = html.escape
+        with pstate: cur = dict(PHONES.get(edit, {})) if edit else {}
+        if cur:                                    # edit mode: pre-fill from the saved phone
+            form = dict(formtitle=f"Edit phone <code>{e(edit)}</code>", orig_mac=e(edit), addmac=e(edit),
+                        ext_val=e(str(cur.get("extension", ""))), auth_val=e(str(cur.get("auth_id", ""))),
+                        label_val=e(cur.get("label", "")), pw_hint="(blank = keep current password)",
+                        pin_hint=("set - blank keeps it" if cur.get("tui_pwd_md5") else "none - any PIN opens Options"),
+                        cancel="<a href=/>cancel</a>")
+        else:
+            form = dict(formtitle="Add a phone", orig_mac="", addmac=e(addmac), ext_val="",
+                        auth_val="", label_val="", pw_hint="", cancel="",
+                        pin_hint="digits; blank = no PIN (any PIN opens Options)")
+        crow = []
+        for r in sorted(load_calllog(), key=lambda r: r.get("start", 0), reverse=True)[:15]:
+            kind = "missed" if r.get("missed") else ("&#8601; in" if r.get("direction") == "in" else "&#8599; out")
+            crow.append(f"<tr><td>{time.strftime('%b %d %H:%M', time.localtime(r.get('start', 0)))}</td>"
+                        f"<td>{kind}</td><td>{e(str(r.get('number','')))}</td><td>{e(r.get('name',''))}</td>"
+                        f"<td>{e(str(r.get('ext','')))}</td><td>{'' if r.get('missed') else str(r.get('duration',0))+'s'}</td></tr>")
+        callhtml = "".join(crow) or "<tr><td colspan=6><small>none yet</small></td></tr>"
+        page = PAGE.format(ip=MYIP, rows=rowhtml, discovered=disc, cfg=PHONES_JSON, catalog=catalog,
+                           connstatus=connstatus, directory=dirhtml, calls=callhtml, **form)
         self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
-        self.wfile.write(html.encode())
+        self.wfile.write(page.encode())
     def do_GET(self):
         q = parse_qs(urlparse(self.path).query)
-        self._page(addmac=q.get("add", [""])[0])
+        if urlparse(self.path).path == "/buttons":
+            return self._buttons_page(norm_mac(q.get("mac", [""])[0]) or "", q.get("saved", [""])[0])
+        self._page(addmac=q.get("add", [""])[0], edit=norm_mac(q.get("edit", [""])[0]) or "")
+    def _buttons_page(self, mac, saved=""):
+        e = html.escape
+        with pstate: p = dict(PHONES.get(mac, {}))
+        if not p:
+            self.send_response(302); self.send_header("Location", "/"); self.end_headers(); return
+        btns = p.get("buttons") or {}
+        def row(n):
+            b = btns.get(str(bb_sk(1, n)), {})
+            cur = int(b.get("func", 1) or 1)
+            opts = "".join(f"<option value={fid}{' selected' if fid == cur else ''}>{e(nm)}</option>"
+                           for fid, nm in PROG_FUNCS)
+            if cur not in PROG_FUNC_NAMES:
+                opts += f"<option value={cur} selected>code {cur}</option>"
+            return (f"<tr><td><b>{n}</b></td><td><select name=f{n}>{opts}</select></td>"
+                    f"<td><input name=t{n} value='{e(str(b.get('target','')))}' size=14 placeholder='number / ext'></td>"
+                    f"<td><input name=l{n} value='{e(str(b.get('label','')))}' size=12 maxlength=16 placeholder='label'></td></tr>")
+        left = "".join(row(n) for n in range(1, 13)); right = "".join(row(n) for n in range(13, 25))
+        hdr = "<tr><th>#</th><th>Function</th><th>Number</th><th>Label</th></tr>"
+        # Phone's own 8 keys (device 0, SK 1..8). Configuring any of these makes the
+        # bridge actually emit [progbuttons] -- the live experiment.
+        def prow(n):
+            b = btns.get(str(n), {})
+            cur = int(b.get("func", 1) or 1)
+            opts = "".join(f"<option value={fid}{' selected' if fid == cur else ''}>{e(nm)}</option>"
+                           for fid, nm in PROG_FUNCS)
+            if cur not in PROG_FUNC_NAMES:
+                opts += f"<option value={cur} selected>code {cur}</option>"
+            return (f"<tr><td><b>{n}</b></td><td><select name=pf{n}>{opts}</select></td>"
+                    f"<td><input name=pt{n} value='{e(str(b.get('target','')))}' size=14 placeholder='number / ext'></td>"
+                    f"<td><input name=pl{n} value='{e(str(b.get('label','')))}' size=12 maxlength=16 placeholder='label'></td></tr>")
+        phone_tbl = "".join(prow(n) for n in range(1, PHONE_KEYS + 1))
+        exp = ("<p class=card style='background:#fee2e2'><b>Config channel: disproven (2026-11-09).</b> "
+               "A speed dial written here to the phone's own key did <b>not</b> appear after a "
+               "reboot. Disassembly confirms why: the phone builds its 8 keys from "
+               "<b>locally persisted state</b>, not the served config, and the firmware never "
+               "builds a button device for the BB424. The bridge therefore <b>no longer emits</b> "
+               "<code>[progbuttons]</code> (it is ignored and only risks the phone's own keys). "
+               "Programming a key <b>on the phone itself</b> is the only path that sticks. These "
+               "tables remain a stored record / scratchpad in case a live CAS push path is found.</p>")
+        warn = ("<p class=card style='background:#fef3c7'><b>BB424 not working.</b> Only one "
+                "programmable-button device (the phone's 8 keys) is ever created by this "
+                "firmware; the box is never built from any served config. Populating it appears "
+                "to require a real ShoreTel/MiVoice switch, or a live CAS push we have not found.</p>")
+        note = ("<p class=card style='background:#ecfdf5'>Saved to the stored layout (not pushed to the phone).</p>"
+                if saved else "")
+        css = CSS.replace("{{", "{").replace("}}", "}") + ".cols{display:flex;gap:1.5rem;flex-wrap:wrap}.cols table{width:auto}"
+        page = f"""<!doctype html><html><head><meta charset=utf-8><title>Buttons - {e(p.get('label') or mac)}</title>
+<style>{css}</style></head><body><div class=wrap>
+<div class=bar><h1>Phone &amp; BB424 buttons <small>{e(p.get('label') or '')} &middot; ext {e(str(p.get('extension','')))} &middot; <code>{e(mac)}</code></small></h1><a href=/>&larr; back</a></div>
+{note}
+<form method=post action=/buttons-save>
+<input type=hidden name=mac value='{e(mac)}'>
+<h2>Phone keys (1&ndash;8) &mdash; speed-dial experiment</h2>
+{exp}
+<div class=cols><table>{hdr}{phone_tbl}</table></div>
+<h2>BB424 button box</h2>
+{warn}
+<div class=cols><table>{hdr}{left}</table><table>{hdr}{right}</table></div>
+<p><button type=submit>Save layout</button>
+<small>Phone keys 1&ndash;8 are the phone's own keys. BB424 buttons 1&ndash;12 are its left column, 13&ndash;24 the right.</small></p>
+</form></div></body></html>"""
+        self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+        self.wfile.write(page.encode())
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0)); body = self.rfile.read(n).decode()
         f = {k: v[0] for k, v in parse_qs(body).items()}
@@ -1782,6 +2037,15 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             reply = send_to_phone_csta(mac, xml)
             self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
             self.wfile.write(("SENT:\n" + xml + "\n\nREPLY:\n" + (reply or "") + "\n").encode()); return
+        if path == "/debug/notify" and DEBUG:
+            # body = raw payload; ?mac=&event=&ctype=&from=  (debug only)
+            q = parse_qs(urlparse(self.path).query)
+            mac = norm_mac(q.get("mac", [""])[0]) or next(iter(CONNS), "")
+            reply = send_to_phone_notify(mac, q.get("event", ["ua-profile"])[0],
+                                         q.get("ctype", ["text/plain"])[0], body,
+                                         q.get("from", ["switch"])[0])
+            self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
+            self.wfile.write((reply + "\n").encode()); return
         if path == "/debug/probe" and DEBUG:
             mac = norm_mac(f.get("mac", ""))
             out = csta_probe(mac)
@@ -1806,8 +2070,36 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
             self.wfile.write((f"pushed {len(events)} event(s) to ip={ip} sid={sid}\n"
                               f"(watch: shorebridge logs)\n").encode()); return
+        if path == "/buttons-save":
+            mac = norm_mac(f.get("mac", ""))
+            with pstate:
+                if mac in PHONES:
+                    btns = PHONES[mac].setdefault("buttons", {})
+                    for n in range(1, BB_BUTTONS + 1):
+                        sk = str(bb_sk(1, n))
+                        try: func = int(f.get(f"f{n}", "1"))
+                        except Exception: func = 1
+                        tgt = f.get(f"t{n}", "").strip(); lab = f.get(f"l{n}", "").strip()
+                        if func in (0, 1) and not tgt: btns.pop(sk, None)
+                        else: btns[sk] = {"func": func, "target": tgt, "label": lab, "long": lab}
+                    # phone's own keys (device 0, SK 1..8) -- the speed-dial experiment
+                    for n in range(1, PHONE_KEYS + 1):
+                        sk = str(n)
+                        try: func = int(f.get(f"pf{n}", "1"))
+                        except Exception: func = 1
+                        tgt = f.get(f"pt{n}", "").strip(); lab = f.get(f"pl{n}", "").strip()
+                        if func in (0, 1) and not tgt: btns.pop(sk, None)
+                        else: btns[sk] = {"func": func, "target": tgt, "label": lab, "long": lab}
+            save_phones()
+            try: write_phoneconfig()
+            except Exception as e: log(f"phoneconfig rewrite failed: {e!r}")
+            log(f"UI: saved button layout for {mac} (stored only; [progbuttons] not emitted)")
+            self.send_response(303); self.send_header("Location", f"/buttons?mac={mac}&saved=1"); self.end_headers()
+            return
         if path == "/add":
             mac = norm_mac(f.get("mac", ""))
+            orig = norm_mac(f.get("orig_mac", "")) or mac
+            with pstate: prev = dict(PHONES.get(orig) or PHONES.get(mac) or {})
             pick = f.get("catalog_ext", "").strip()
             rec = None
             if pick:
@@ -1815,15 +2107,28 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
                     rec = next((e for e in CATALOG if e.number == pick), None)
             ext = f.get("extension", "").strip() or (rec.number if rec else "")
             authid = f.get("auth_id", "").strip() or (rec.auth_id if rec else ext)
-            password = f.get("password", "") or (rec.password if rec else "")
+            password = f.get("password", "") or (rec.password if rec else "") or prev.get("password", "")
             label = f.get("label", "").strip() or (rec.display_name if rec else "")
             if mac and ext and password:
                 with pstate:
-                    PHONES[mac] = {"extension": ext, "auth_id": authid, "password": password, "label": label}
+                    if orig != mac: PHONES.pop(orig, None)      # MAC changed while editing
+                    PHONES[mac] = {**prev, "extension": ext, "auth_id": authid,
+                                   "password": password, "label": label}
+                    pin = re.sub(r"\D", "", f.get("tui_pin", ""))
+                    if f.get("tui_pin_clear"): PHONES[mac].pop("tui_pwd_md5", None)
+                    elif pin: PHONES[mac]["tui_pwd_md5"] = pin_md5(pin)
                     SEEN.pop(mac, None)
-                save_phones(); ensure_registrations(); log(f"UI: saved phone {mac} -> ext {ext}")
+                save_phones(); ensure_registrations()
+                try: write_phoneconfig()                       # push new ext/name to the phone's config files
+                except Exception as ex: log(f"UI: phoneconfig rewrite failed: {ex!r}")
+                log(f"UI: {'updated' if prev else 'saved'} phone {mac} -> ext {ext}")
             else:
                 log(f"UI: incomplete add for {mac} (need extension + password)")
+        elif path == "/reboot":
+            mac = norm_mac(f.get("mac", ""))
+            when = f.get("when", "").strip() or REBOOT_WHEN
+            log(f"UI: reboot phone {mac} (when={when})")
+            threading.Thread(target=reboot_phone, args=(mac, when), daemon=True).start()
         elif path == "/delete":
             mac = norm_mac(f.get("mac", ""))
             with pstate: PHONES.pop(mac, None)

@@ -141,6 +141,35 @@ Calls and multi-phone work. The remaining items are the proprietary `uaCSTA` "fe
 
 These share the same uaCSTA plumbing and are good contribution targets.
 
+## Fork additions
+
+This fork extends upstream with features verified on a **ShoreTel IP485g (firmware `804.2210`)** bridged to **voip.ms**. Several check off items from the upstream roadmap above.
+
+| Feature | Notes |
+|---|---|
+| Idle-screen display name | `userFirstName` / `userLastName` served per phone |
+| Hold / resume | in-dialog re-INVITE handling; plays the PBX's hold music |
+| DTMF | `telephone-event` relay with per-leg payload-type relabeling |
+| Voicemail light (MWI) | SUBSCRIBE to the PBX; unsolicited NOTIFY to the phone |
+| Voicemail key | dials a configurable number (`[phone] voicemail_number`, default `*97`) |
+| Call history | list with in/out/missed icons, dates, and per-entry delete |
+| Options menu + PIN | per-phone Options PIN with lockout after repeated failures |
+| Directory | contacts served over CAS |
+| Admin UI tabs | Phones / Recent calls / Directory, plus a BB424 layout page |
+| Remote reboot | SIP NOTIFY `Event: reboot;when=immediate|on-idle`; optional auto-reboot of connected phones when the bridge restarts (`[bridge] reboot_phones_on_restart`) |
+| INVITE-before-REGISTER robustness | an INVITE (e.g. the Voicemail key) arriving before the phone has REGISTERed on that TLS connection is identified by source IP instead of rejected |
+
+New config keys (see [`config.example.ini`](config.example.ini)): `[phone] voicemail_number`, `[bridge] reboot_phones_on_restart`, `[bridge] reboot_when`.
+
+### Known limitation: BB424 button box
+
+The **BB424** 24-button expansion box **cannot be populated** by the bridge. Investigated exhaustively (served config, CAS push, uaCSTA, and firmware disassembly): the `804` firmware builds exactly **one** programmable-button device (the phone's own 8 keys) and never constructs a device for the box from any config a switch-emulator can serve. The phone *detects and reports* the box over uaCSTA, but populating its labels requires a genuine ShoreTel/MiVoice switch.
+
+### Roadmap (this fork)
+
+- **MiVoice Connect MITM proxy mode** — run the bridge as a logging TLS proxy *in front of a real MiVoice/ShoreTel server* (the phone already trusts the bridge's CA, so the phone-facing TLS termination is done) to capture, in cleartext, how a genuine switch provisions the BB424 — then replicate it standalone.
+- Config-driven speed dials on the phone's **own** 8 keys (the one programmable-button device the firmware does build).
+
 ## How the firmware conversion happened (context)
 
 The phones were moved from native ShoreTel firmware to the Mitel/RingCentral "generic SIP" load by pointing their Config Server at the Mitel conversion service and rebooting. That conversion is one-way. shorebridge does **not** flash firmware; it works with the phone as-is on that generic-SIP load.

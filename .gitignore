@@ -11,3 +11,18 @@ www/
 __pycache__/
 *.pyc
 .DS_Store
+
+# vendor firmware (proprietary, not redistributable) + extracted blobs
+firmware/
+*.st
+*.st.*
+*.bin
+# per-phone records (SIP passwords, PIN hashes) and runtime state
+phones.json
+phone_ips.json
+calls.json
+calls.json.seq
+directory.json
+cas_overrides.json
+history_format.json
+.version

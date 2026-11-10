@@ -18,8 +18,8 @@ connection; per-phone credentials are never in config.ini.
 
 Single process, Python standard library only.
 """
-import socket, ssl, threading, hashlib, random, time, re, os, sys, json, configparser
-import http.server, socketserver, functools
+import socket, ssl, threading, hashlib, random, time, re, os, sys, json, configparser, signal
+import http.server, socketserver, functools, html
 from urllib.parse import parse_qs, urlparse
 import connectors
 
@@ -44,9 +44,16 @@ _bind    = CFG.get("bridge", "bind_ip", fallback="auto").strip()
 MYIP     = detect_ip(SBC_IP) if _bind in ("", "auto") else _bind
 DATA     = CFG.get("bridge", "data_dir", fallback="/opt/shorebridge")
 TZ       = CFG.get("phone", "timezone", fallback="Eastern Standard Time")
+# Number the phone's Voicemail key dials (voip.ms: *97 = own mailbox).
+VM_NUMBER = CFG.get("phone", "voicemail_number", fallback="*97")
 DEBUG    = CFG.getboolean("bridge", "debug", fallback=False)
 UI_PORT  = CFG.getint("bridge", "ui_port", fallback=8910)
 CSTA_AUTOANSWER = CFG.getboolean("bridge", "csta_test_autoanswer", fallback=False)  # test: auto-fire AnswerCall on inbound ring
+# Reboot connected phones when the bridge is stopped/restarted (SIGTERM). Off by default
+# so dev restarts don't bounce the phone. reboot_when: "on-idle" (wait for no active call)
+# or "immediate". The phone honors Event: reboot;when=<v> over SIP-NOTIFY (firmware-verified).
+REBOOT_ON_RESTART = CFG.getboolean("bridge", "reboot_phones_on_restart", fallback=False)
+REBOOT_WHEN = CFG.get("bridge", "reboot_when", fallback="on-idle").strip() or "on-idle"
 
 HTTP_ROOT = os.path.join(DATA, "www")
 CERT = os.path.join(DATA, "tls", "switch_fullchain.crt")
@@ -114,6 +121,15 @@ def creds_for_mac(mac):
 def mac_for_ext(ext):
     for mac, p in PHONES.items():
         if p["extension"] == ext: return mac
+    return None
+
+def mac_for_ip(ip):
+    """Reverse the MAC->IP map (populated at REGISTER). Lets an INVITE that arrives on a
+    TLS connection before this phone has REGISTERed on it still be identified, e.g. a
+    *97 dialed in the gap right after a bridge restart."""
+    if not ip: return None
+    for mac, pip in PHONE_IPS.items():
+        if pip == ip and mac in PHONES: return mac
     return None
 
 # ----------------------------- SIP helpers -----------------------------
@@ -221,6 +237,106 @@ def ensure_registrations():
                 reg_threads[ext] = True
                 threading.Thread(target=reg_loop, args=(ext,), daemon=True).start()
                 log(f"starting registration for ext {ext}")
+            if ext not in mwi_threads:
+                mwi_threads[ext] = True
+                threading.Thread(target=mwi_loop, args=(ext,), daemon=True).start()
+
+# ----------------------------- voicemail light (MWI) -----------------------------
+# PBX side: per extension, SUBSCRIBE to message-summary (digest auth, refreshed) and
+# answer the PBX's NOTIFYs. Phone side: the phone never subscribes, so we push an
+# unsolicited NOTIFY (simple-message-summary) over its TLS connection on every
+# change and whenever it re-registers.
+MWI = {}                 # ext -> {"waiting": bool, "new": int, "old": int}
+mwi_threads = {}
+MWI_SUBS = {}            # PBX subscription Call-ID -> ext
+MWI_PHONE = {}           # mac -> {"callid","tag","cseq"} for our NOTIFY dialog to the phone
+
+def parse_mwi(body):
+    waiting, new, old = False, 0, 0
+    for line in (body or "").splitlines():
+        k, _, v = line.partition(":"); k = k.strip().lower(); v = v.strip()
+        if k == "messages-waiting": waiting = v.lower().startswith("y")
+        elif k == "voice-message":
+            m = re.match(r"(\d+)\s*/\s*(\d+)", v)
+            if m: new, old = int(m.group(1)), int(m.group(2))
+    return {"waiting": waiting or new > 0, "new": new, "old": old}
+
+def on_mwi(ext, st):
+    prev = MWI.get(ext); MWI[ext] = st
+    if prev != st:
+        log(f"voicemail ext {ext}: {st['new']} new / {st['old']} old -> lamp {'ON' if st['waiting'] else 'off'}")
+    mac = mac_for_ext(ext)
+    if mac: push_mwi_to_phone(mac)
+
+def push_mwi_to_phone(mac):
+    with pstate:
+        conn = CONNS.get(mac); contact = CONTACTS.get(mac); p = PHONES.get(mac)
+    if not (conn and contact and p): return
+    ext = str(p.get("extension", "")); st = MWI.get(ext)
+    if st is None: return
+    d = MWI_PHONE.setdefault(mac, {"callid": rid(16) + "@" + MYIP, "tag": rid(8), "cseq": 0})
+    d["cseq"] += 1
+    body = (f"Messages-Waiting: {'yes' if st['waiting'] else 'no'}\r\n"
+            f"Message-Account: sips:{ext}@{MYIP}\r\n"
+            f"Voice-Message: {st['new']}/{st['old']} (0/0)\r\n").encode()
+    L = [f"NOTIFY {contact} SIP/2.0", f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)};rport",
+         "Max-Forwards: 70", f"From: <sips:{ext}@{MYIP}>;tag={d['tag']}", f"To: <sips:{ext}@{MYIP}>",
+         f"Call-ID: {d['callid']}", f"CSeq: {d['cseq']} NOTIFY", "Event: message-summary",
+         "Subscription-State: active;expires=3600", f"Contact: <sips:switch@{MYIP}:5061;transport=tls>",
+         "Content-Type: application/simple-message-summary", f"Content-Length: {len(body)}"]
+    try:
+        conn.sendall(("\r\n".join(L) + "\r\n\r\n").encode() + body)
+        dbg(f"MWI -> phone {mac}: {'yes' if st['waiting'] else 'no'} {st['new']}/{st['old']}")
+    except Exception as e:
+        log(f"MWI push to {mac} failed: {e!r}")
+
+def mwi_loop(ext):
+    callid = rid(16) + "@" + MYIP; ftag = rid(8); cseq = 0; totag = ""; warned = False
+    with pstate: MWI_SUBS[callid] = ext
+    while True:
+        creds = None
+        with pstate:
+            for mac, p in PHONES.items():
+                if p["extension"] == ext: creds = (p["auth_id"], p["password"]); break
+        if creds is None:
+            with pstate: mwi_threads.pop(ext, None); MWI_SUBS.pop(callid, None)
+            log(f"voicemail subscription for ext {ext} stopped (phone removed)"); return
+        authid, password = creds
+        def mk(n, auth=None, hdr="Authorization"):
+            L = [f"SUBSCRIBE sip:{ext}@{DOMAIN} SIP/2.0",
+                 f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch=z9hG4bK{rid(16)};rport", "Max-Forwards: 70",
+                 f"From: <sip:{ext}@{DOMAIN}>;tag={ftag}", f"To: <sip:{ext}@{DOMAIN}>" + (f";tag={totag}" if totag else ""),
+                 f"Call-ID: {callid}", f"CSeq: {n} SUBSCRIBE", f"Contact: <sip:{ext}@{MYIP}:{P3CX}>",
+                 "Event: message-summary", "Accept: application/simple-message-summary",
+                 "Expires: 3600", "User-Agent: ShoreBridge/1.0"]
+            if auth: L.append(f"{hdr}: {auth}")
+            L.append("Content-Length: 0"); return "\r\n".join(L) + "\r\n\r\n"
+        cseq += 1
+        with wlock: waiters[callid] = []
+        u3_send(mk(cseq)); r = wait(callid, 4)
+        if r and r.split("\r\n")[0].split()[1] in ("401", "407"):
+            st = r.split("\r\n")[0]
+            hh = [l for l in r.split("\r\n") if l.lower().startswith(("www-authenticate", "proxy-authenticate"))]
+            realm, nonce, qop, opaque = parse_auth(hh[0]) if hh else (None,) * 4
+            hdr = "Proxy-Authorization" if " 407 " in st else "Authorization"
+            auth = digest("SUBSCRIBE", f"sip:{ext}@{DOMAIN}", realm, nonce, qop, rid(16), "00000001", opaque, authid, password)
+            cseq += 1
+            with wlock: waiters[callid] = []
+            u3_send(mk(cseq, auth, hdr)); r = wait(callid, 4)
+        with wlock: waiters.pop(callid, None)
+        code = r.split("\r\n")[0].split()[1] if r else "timeout"
+        if code.startswith("2"):
+            _, h, _ = parse(r); m = re.search(r";tag=([^;>\s]+)", H(h, "to"))
+            if m: totag = m.group(1)
+            try: exp = int(re.sub(r"\D", "", H(h, "expires")) or 3600)
+            except Exception: exp = 3600
+            if warned or not MWI.get(ext): dbg(f"voicemail subscription ext {ext}: {code}, expires {exp}s")
+            warned = False
+            time.sleep(max(60, min(exp - 60, 1800)))
+        else:
+            if not warned: log(f"voicemail subscription ext {ext} failed: {code} (retrying every 10 min)")
+            warned = True; totag = ""
+            time.sleep(600)
 
 CALLS = {}
 PIN = {}; pinlock = threading.Lock()
@@ -247,7 +363,20 @@ def _dispatch(start, hdrs, cid, msg, addr):
         if method == "OPTIONS":
             u3_send(resp_line(200, "OK", hdrs))
         elif method == "INVITE":
-            threading.Thread(target=inbound_invite, args=(hdrs, msg, addr), daemon=True).start()
+            cs = CALLS.get(cid)
+            if cs and cs.alive and ";tag=" in H(hdrs, "to"):      # in-dialog re-INVITE
+                threading.Thread(target=pbx_reinvite, args=(cs, hdrs, msg, addr), daemon=True).start()
+            else:
+                threading.Thread(target=inbound_invite, args=(hdrs, msg, addr), daemon=True).start()
+        elif method == "NOTIFY":
+            u3.sendto(resp_line(200, "OK", hdrs).encode(), addr)
+            if "message-summary" in H(hdrs, "event").lower():
+                _, _, body = parse(msg)
+                ext = MWI_SUBS.get(cid)
+                if not ext:                          # unsolicited: take the user part of To
+                    m = re.search(r"sips?:([^@>;]+)@", H(hdrs, "to")); ext = m.group(1) if m else ""
+                if ext and mac_for_ext(ext): on_mwi(ext, parse_mwi(body))
+                elif DEBUG: dbg(f"MWI NOTIFY for unknown ext {ext!r}")
         elif method in ("BYE", "CANCEL", "ACK"):
             for cs in list(CALLS.values()):
                 if cs.x_callid == cid: cs.on_3cx_request(method, hdrs, msg)
@@ -261,7 +390,10 @@ def resp_line(code, reason, hdrs):
 
 # ----------------------------- RTP relay -----------------------------
 def alloc_rtp():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # No SO_REUSEADDR here: on Linux it lets two UDP sockets bind the SAME port, so the
+    # phone-side and PBX-side sockets of a call collided and the phone's audio was
+    # looped back to the phone instead of reaching the PBX (one-way audio).
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     for p in range(12000, 12800, 2):
         try: s.bind((MYIP, p)); return s, p
         except OSError: continue
@@ -275,6 +407,249 @@ def sdp_media(sdp):
         if line.startswith("m=audio") and port is None: port = int(line.split()[1])
     return (ip, port) if ip and port else None
 
+# ----------------------------- call log (for the phone's History) -----------------------------
+CALLS_JSON = os.path.join(DATA, "calls.json")
+HISTORY_FMT_JSON = os.path.join(DATA, "history_format.json")
+CALLLOG_LOCK = threading.Lock()
+CALLLOG_MAX = 200
+
+def load_calllog():
+    try:
+        with open(CALLS_JSON) as f: d = json.load(f); return d if isinstance(d, list) else []
+    except Exception: return []
+
+def _digits(n): return re.sub(r"\D", "", str(n or ""))[-10:]
+def name_for_number(num):
+    """Best-effort caller name from the directory / configured phones (last 10 digits)."""
+    key = _digits(num)
+    if not key: return ""
+    for e in load_directory():
+        if _digits(e.get("number")) == key: return e.get("name", "")
+    for p in PHONES.values():
+        if _digits(p.get("extension")) == key: return p.get("label", "")
+    return ""
+
+def delete_calllog(ext, ids=None):
+    """Remove this extension's records: all of them (ids=None) or just those ids.
+    Other phones' records are never touched. Returns the number removed."""
+    if not ext: return 0                        # unidentified phone: never delete
+    with CALLLOG_LOCK:
+        log_ = load_calllog()
+        keep = [r for r in log_ if (ext and r.get("ext") != ext)
+                or (ids is not None and r.get("id") not in ids)]
+        removed = len(log_) - len(keep)
+        if removed:
+            # remember the highest id ever issued before dropping records, so it is never reused
+            seq_f = CALLS_JSON + ".seq"
+            try: last = int(open(seq_f).read().strip() or 0)
+            except Exception: last = 0
+            hi = max([last] + [r.get("id", 0) for r in log_])
+            with open(seq_f, "w") as f: f.write(str(hi))
+            tmp = CALLS_JSON + ".tmp"
+            with open(tmp, "w") as f: json.dump(keep, f, indent=1)
+            os.replace(tmp, CALLS_JSON)
+    return removed
+
+def record_call(cs):
+    try:
+        peer = getattr(cs, "peer", "") or cs.dst
+        start = getattr(cs, "t_start", None) or time.time(); up = getattr(cs, "t_up", None)
+        direction = getattr(cs, "direction", "out")
+        rec = {"ext": cs.ext, "mac": cs.mac, "direction": direction, "number": peer,
+               "name": name_for_number(peer), "start": int(start),
+               "duration": int(time.time() - up) if up else 0,
+               "answered": bool(up), "missed": direction == "in" and not up}
+        with CALLLOG_LOCK:
+            log_ = load_calllog()
+            # ids are never reused (the phone caches recids): keep a high-water mark
+            seq_f = CALLS_JSON + ".seq"
+            try: last = int(open(seq_f).read().strip() or 0)
+            except Exception: last = 0
+            rec["id"] = max(last, max((r.get("id", 0) for r in log_), default=0)) + 1
+            with open(seq_f, "w") as f: f.write(str(rec["id"]))
+            log_.append(rec); log_ = log_[-CALLLOG_MAX:]
+            tmp = CALLS_JSON + ".tmp"
+            with open(tmp, "w") as f: json.dump(log_, f, indent=1)
+            os.replace(tmp, CALLS_JSON)
+        log(f"call log: #{rec['id']} {direction} {peer} {'missed' if rec['missed'] else str(rec['duration'])+'s'}")
+    except Exception as e:
+        log("call log err " + repr(e))
+
+# History reply format, from the IP485g firmware (bin/linemgrSip, CasCallLogsParser):
+# reply keys request-id/response/details/message + "records"; records use the same
+# COLUMNAR layout as the directory: element[0] = header (field names), then rows.
+# Record fields: recid rec-type ts-start duration-secs time-label secure
+# call-recording-flag parties; each party list is columnar too: name number
+# number-canonical. The numeric rec-type codes are NOT in the binary as text, so
+# they (and the ts-start unit) are read from history_format.json on every request.
+HIST_HDR  = ["recid", "rec-type", "ts-start", "duration-secs", "time-label", "secure",
+             "call-recording-flag", "parties"]
+PARTY_HDR = ["name", "number", "number-canonical"]
+HISTORY_FMT_DEFAULT = {"rec_type": {"in": 1, "out": 2, "missed": 3}, "ts_units": "s", "time_label": 0}
+
+def _canon(num):
+    d = re.sub(r"\D", "", str(num or ""))
+    if len(d) == 10: return "+1" + d
+    if len(d) == 11 and d.startswith("1"): return "+" + d
+    return str(num or "")
+
+def cas_history_response(req, ext, sid=""):
+    try:
+        with open(HISTORY_FMT_JSON) as f: fmt = {**HISTORY_FMT_DEFAULT, **json.load(f)}
+    except Exception: fmt = HISTORY_FMT_DEFAULT
+    msg = req.get("message"); rid_ = req.get("request-id", 0)
+    base = {"request-id": rid_, "topic": "history", "message": msg, "response": 0}
+    if msg in ("delete-recs", "delete-all"):
+        log(f"CAS history {msg} request: {json.dumps(req)[:300]}")
+        ids = req.get("recids", req.get("recid", []))
+        if not isinstance(ids, list): ids = [ids]
+        ids = {int(x) for x in ids if str(x).lstrip("-").isdigit()}
+        n = delete_calllog(ext, None if msg == "delete-all" else ids)
+        log(f"CAS history {msg} -> removed {n} rec(s) for ext {ext}")
+        return base
+    if msg not in ("get-recs", "get-page-view"):
+        log(f"CAS history {msg} -> ok"); return base          # close-page-view etc.
+    recs = [r for r in load_calllog() if not ext or r.get("ext") == ext]
+    # newest first, except get-recs forward=true (asks for the oldest end)
+    recs.sort(key=lambda r: r.get("start", 0), reverse=not (msg == "get-recs" and req.get("forward")))
+    try: mx = int(req.get("max", req.get("count", 50)))   # get-page-view uses "count"
+    except Exception: mx = 50
+    rt = fmt.get("rec_type", HISTORY_FMT_DEFAULT["rec_type"])
+    mult = 1000 if fmt.get("ts_units") == "ms" else 1
+    rows = [HIST_HDR]
+    for r in recs[:max(0, mx)]:
+        kind = "missed" if r.get("missed") else ("in" if r.get("direction") == "in" else "out")
+        name = r.get("name") or ""
+        parties = [PARTY_HDR, [name, str(r.get("number", "")), _canon(r.get("number"))]]
+        rows.append([r.get("id", 0), rt.get(kind, 0), int(r.get("start", 0)) * mult,
+                     int(r.get("duration", 0)), fmt.get("time_label", 0), False, False, parties])
+    resp = {**base, "records": rows}
+    log(f"CAS history {msg} max={req.get('max')} count={req.get('count')} forward={req.get('forward')} -> {len(rows)-1} rec(s)")
+    if DEBUG: dbg("CAS history reply: " + json.dumps(resp)[:800])
+    return resp
+
+# ---- in-dialog re-INVITE (hold / resume / session-timer refresh) ----
+# Both legs are answered locally by the bridge: the RTP relay keeps running, we just
+# mirror the offered direction so each side sees a valid answer. Without this a
+# re-INVITE was treated as a brand-new call (Hold dropped the phone's call leg).
+_MIRROR = {"sendonly": "recvonly", "recvonly": "sendonly", "inactive": "inactive", "sendrecv": "sendrecv"}
+def sdp_dir(sdp):
+    """Direction of the first audio m-section of an offer (c=0.0.0.0 = old-style hold)."""
+    d = "sendrecv"; in_audio = False; seen = False
+    for line in (sdp or "").split("\n"):
+        line = line.strip()
+        if line.startswith("m="):
+            if seen: break
+            in_audio = line.startswith("m=audio"); seen = seen or in_audio
+        elif line.startswith("c=IN IP4 0.0.0.0"): d = "inactive"
+        elif in_audio and line[2:] in _MIRROR and line.startswith("a="): d = line[2:]
+    return d
+def _next_ver(cs):
+    cs.sdp_ver = getattr(cs, "sdp_ver", 1) + 1; return cs.sdp_ver
+def reinvite_answer(cs, offer, leg):
+    """Answer SDP for a re-INVITE on leg 'phone' or 'pbx', same m-line count as the offer."""
+    d = _MIRROR.get(sdp_dir(offer), "sendrecv"); v = _next_ver(cs)
+    nm = max(1, sum(1 for l in (offer or "").split("\n") if l.startswith("m=")))
+    if leg == "phone":
+        sdp = ("v=0\r\n" f"o=switch 1 {v} IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
+               f"m=audio {cs.rpP} RTP/AVP 0 {cs.phone_te}\r\n" "a=rtpmap:0 PCMU/8000\r\n"
+               f"a=rtpmap:{cs.phone_te} telephone-event/8000\r\n" "a=ptime:20\r\n" f"a={d}\r\n")
+        sdp += "m=audio 0 RTP/SAVP 0\r\n" * (nm - 1)
+    else:
+        sdp = ("v=0\r\n" f"o=bridge 1 {v} IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
+               f"m=audio {cs.rp3} RTP/AVP 0 {cs.pbx_te}\r\n" "a=rtpmap:0 PCMU/8000\r\n"
+               f"a=rtpmap:{cs.pbx_te} telephone-event/8000\r\n" f"a={d}\r\n")
+        sdp += "m=audio 0 RTP/AVP 0\r\n" * (nm - 1)
+    return sdp, d
+
+def phone_reinvite(conn, cs, hdrs, body, addr):
+    m = sdp_media(body)
+    if m and m[1] and m[0] != "0.0.0.0": cs.phone_rtp = m
+    ans, d = reinvite_answer(cs, body, "phone")
+    conn.sendall(p_resp(200, "OK", hdrs, addr, "INVITE", sdp=ans))
+    pd = sdp_dir(body)
+    log(f"phone re-INVITE on {cs.dst}: {pd} -> answered {d}"
+        + (" (hold)" if d in ("recvonly", "inactive") else ""))
+    # Pass hold/resume on to the PBX so it plays its music-on-hold to the far end.
+    # Skip pure session-timer refreshes (direction unchanged).
+    if pd != getattr(cs, "x_dir", "sendrecv"):
+        threading.Thread(target=x_reinvite, args=(cs, pd), daemon=True).start()
+
+def x_reinvite(cs, direction):
+    """In-dialog re-INVITE to the PBX leg offering `direction` (sendonly = hold,
+    sendrecv = resume). Handles one digest challenge, ACKs the 2xx."""
+    leg = cs.x_dialog
+    if not leg: return
+    with pstate: creds = creds_for_mac(cs.mac)
+    authid, password = (creds[1], creds[2]) if creds else (cs.authid, cs.password)
+    v = _next_ver(cs)
+    sdp = ("v=0\r\n" f"o=bridge 1 {v} IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
+           f"m=audio {cs.rp3} RTP/AVP 0 {cs.pbx_te}\r\n" "a=rtpmap:0 PCMU/8000\r\n"
+           f"a=rtpmap:{cs.pbx_te} telephone-event/8000\r\n" f"a={direction}\r\n").encode()
+    def mk(cseq, branch, auth=None, hdr="Proxy-Authorization"):
+        L = [f"INVITE {leg['ruri']} SIP/2.0",
+             f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch={branch};rport"]
+        L += [f"Route: {rt}" for rt in leg.get("route", [])]
+        L += ["Max-Forwards: 70", f"From: {leg['local']};tag={leg['ltag']}", f"To: {leg['remote']}",
+              f"Call-ID: {leg['callid']}", f"CSeq: {cseq} INVITE",
+              f"Contact: <sip:{cs.ext}@{MYIP}:{P3CX}>", "User-Agent: ShoreBridge/1.0"]
+        if auth: L.append(f"{hdr}: {auth}")
+        L += ["Content-Type: application/sdp", f"Content-Length: {len(sdp)}"]
+        return ("\r\n".join(L) + "\r\n\r\n").encode() + sdp
+    def ack(cseq, resp, branch):
+        # non-2xx ACK reuses the INVITE's branch (same transaction); 2xx ACK gets a new one
+        _, h, _ = parse(resp)
+        if resp.split("\r\n")[0].split()[1].startswith("2"): branch = "z9hG4bK" + rid(16)
+        L = [f"ACK {leg['ruri']} SIP/2.0", f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch={branch};rport"]
+        L += [f"Route: {rt}" for rt in leg.get("route", [])]
+        L += ["Max-Forwards: 70", f"From: {leg['local']};tag={leg['ltag']}", f"To: {H(h,'to') or leg['remote']}",
+              f"Call-ID: {leg['callid']}", f"CSeq: {cseq} ACK", "Content-Length: 0"]
+        u3.sendto(("\r\n".join(L) + "\r\n\r\n").encode(), SBC)
+    leg["cseq"] = leg.get("cseq", 1) + 1; cseq = leg["cseq"]
+    br = "z9hG4bK" + rid(16)
+    with wlock: waiters[leg["callid"]] = []
+    u3.sendto(mk(cseq, br), SBC)
+    r = wait_invite(leg["callid"], 6, cseq=cseq)
+    if r and r.split("\r\n")[0].split()[1] in ("401", "407"):
+        st = r.split("\r\n")[0]; ack(cseq, r, br)
+        hh = [l for l in r.split("\r\n") if l.lower().startswith(("www-authenticate", "proxy-authenticate"))]
+        realm, nonce, qop, opaque = parse_auth(hh[0])
+        hdr = "Proxy-Authorization" if " 407 " in st else "Authorization"
+        auth = digest("INVITE", leg["ruri"], realm, nonce, qop, rid(16), "00000001", opaque, authid, password)
+        leg["cseq"] += 1; cseq = leg["cseq"]; br = "z9hG4bK" + rid(16)
+        with wlock: waiters[leg["callid"]] = []
+        u3.sendto(mk(cseq, br, auth, hdr), SBC)
+        r = wait_invite(leg["callid"], 6, cseq=cseq)
+    code = r.split("\r\n")[0].split()[1] if r else "timeout"
+    if DEBUG:
+        dbg("PBX re-INVITE SENT >>>>\n" + mk(cseq, br).decode("utf-8", "replace").strip() + "\n<<<< end")
+        dbg("PBX re-INVITE REPLY >>>>\n" + (r or "(none)").strip() + "\n<<<< end")
+    if r and code.isdigit() and int(code) >= 200: ack(cseq, r, br)
+    if code == "200":
+        _, _, rb = parse(r); m = sdp_media(rb)
+        if m and m[1] and m[0] != "0.0.0.0": cs.x_rtp = m
+        cs.x_dir = direction
+    log(f"PBX re-INVITE {direction} on {cs.dst}: {code}" + (" (hold music from PBX)" if direction != "sendrecv" and code == "200" else ""))
+
+def pbx_reinvite(cs, xh, xraw, xaddr):
+    _, _, xbody = parse(xraw)
+    m = sdp_media(xbody)
+    if m and m[1] and m[0] != "0.0.0.0": cs.x_rtp = m
+    to = H(xh, "to")
+    # (an offer-less re-INVITE gets our sendrecv offer here; its answer comes in the ACK)
+    ans, d = reinvite_answer(cs, xbody, "pbx"); ob = ans.encode()
+    extra = ["Content-Type: application/sdp", f"Content-Length: {len(ob)}"]
+    L = ["SIP/2.0 200 OK"] + allvia(xh) + allrr(xh) + [f"From: {H(xh,'from')}", f"To: {to}",
+         f"Call-ID: {H(xh,'call-id')}", f"CSeq: {H(xh,'cseq')}",
+         f"Contact: <sip:{cs.ext}@{MYIP}:{P3CX}>"] + extra
+    u3.sendto(("\r\n".join(L) + "\r\n\r\n").encode() + ob, xaddr)
+    log(f"PBX re-INVITE on {cs.dst}: {sdp_dir(xbody)} -> answered {d}")
+
+def sdp_te_pt(sdp):
+    """Payload type the SDP assigns to telephone-event (RFC 4733 DTMF), or None."""
+    m = re.search(r"a=rtpmap:(\d+)\s+telephone-event/", sdp or "", re.I)
+    return int(m.group(1)) if m else None
+
 class CallSession:
     def __init__(s, dst, conn, mac, ext, authid, password):
         s.dst = dst; s.pc = conn; s.mac = mac
@@ -285,6 +660,8 @@ class CallSession:
         s.phone_rtp = None; s.x_rtp = None
         s.alive = True; s.p_ftag = None; s.p_totag = None; s.p_addr = None
         s.p_dialog = None; s.x_dialog = None; s.p_inv = None
+        s.t_start = time.time(); s.t_up = None; s.direction = "out"; s.peer = dst
+        s.phone_te = 102; s.pbx_te = 101      # DTMF payload types negotiated on each leg
     def on_3cx_response(s, msg): pass
     def on_3cx_request(s, method, hdrs, msg):
         if method in ("BYE", "CANCEL"): s.teardown(origin="3cx")
@@ -299,6 +676,14 @@ class CallSession:
             for so in r:
                 try: d, a = so.recvfrom(4096)
                 except Exception: continue
+                # DTMF (telephone-event) uses a different payload-type number on each
+                # leg; relabel it or the far end drops the digits.
+                if len(d) >= 12 and (d[0] >> 6) == 2:
+                    pt = d[1] & 0x7F
+                    if so is s.sockP and pt == s.phone_te and s.pbx_te != s.phone_te:
+                        d = d[:1] + bytes([(d[1] & 0x80) | s.pbx_te]) + d[2:]
+                    elif so is s.sock3 and pt == s.pbx_te and s.pbx_te != s.phone_te:
+                        d = d[:1] + bytes([(d[1] & 0x80) | s.phone_te]) + d[2:]
                 if so is s.sockP:
                     s.phone_rtp = a; np_ += 1
                     if s.x_rtp:
@@ -335,6 +720,7 @@ class CallSession:
             except Exception: pass
         CALLS.pop(s.p_callid, None); CALLS.pop(s.x_callid, None)
         log(f"call {s.dst} ended (origin={origin})")
+        record_call(s)
 
 # ----------------------------- outbound: phone -> PBX -----------------------------
 def x_invite(cs):
@@ -429,6 +815,11 @@ def p_resp(code, reason, hdrs, addr, method, sdp=None):
 def phone_invite(conn, mac, hdrs, body, addr):
     to = H(hdrs, "to"); m = re.search(r'sips?:([^@>]+)@', to); dst = m.group(1) if m else "0"
     creds = creds_for_mac(mac)
+    if not creds:                                  # no MAC on this connection yet -> identify by source IP
+        alt = mac_for_ip(addr[0])
+        if alt:
+            log(f"INVITE with no MAC on connection; identified {alt} by IP {addr[0]}")
+            mac = alt; creds = creds_for_mac(mac)
     if not creds:
         log(f"unconfigured phone {mac} tried to dial {dst}")
         conn.sendall(p_resp(403, "Forbidden", hdrs, addr, "INVITE")); return
@@ -446,6 +837,7 @@ def phone_invite(conn, mac, hdrs, body, addr):
         log(f"PBX rejected: {r.splitlines()[0]}")
         conn.sendall(p_resp(code if code < 700 else 486, "Declined", hdrs, addr, "INVITE")); cs.teardown(); return
     _, xh, xb = parse(r); cs.x_rtp = sdp_media(xb); cs.x_totag = H(xh, "to"); x_ack_ok(r, cs)
+    cs.pbx_te = sdp_te_pt(xb) or 101; cs.phone_te = sdp_te_pt(body) or 102
     cs.x_dialog = {'ruri': uri_of(H(xh, "contact")) or f"sip:{dst}@{DOMAIN}", 'transport': 'UDP', 'lport': P3CX,
                    'local': f"<sip:{ext}@{DOMAIN}>", 'ltag': cs.x_ftag, 'remote': H(xh, "to"),
                    'callid': cs.x_callid, 'route': list(reversed(xh.get("record-route", []))), 'cseq': 2}
@@ -454,10 +846,26 @@ def phone_invite(conn, mac, hdrs, body, addr):
                    'callid': cs.p_callid, 'route': [], 'cseq': 1, 'conn': conn}
     threading.Thread(target=cs.relay, daemon=True).start()
     ans = ("v=0\r\n" f"o=switch 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
-           f"m=audio {cs.rpP} RTP/AVP 0 102\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:102 telephone-event/8000\r\n" "a=ptime:20\r\n" "a=sendrecv\r\n"
+           f"m=audio {cs.rpP} RTP/AVP 0 {cs.phone_te}\r\n" "a=rtpmap:0 PCMU/8000\r\n" f"a=rtpmap:{cs.phone_te} telephone-event/8000\r\n" "a=ptime:20\r\n" "a=sendrecv\r\n"
            "m=audio 0 RTP/SAVP 0\r\n")
     conn.sendall(p_resp(200, "OK", hdrs, addr, "INVITE", sdp=ans))
+    cs.t_up = time.time()
     log(f"call up: ext {ext} <-> {dst}")
+
+PHONE_IPS_JSON = os.path.join(DATA, "phone_ips.json")
+def save_phone_ips():
+    """Persist MAC -> last IP so that right after a bridge restart CAS can still tell
+    which phone is talking (the phone reconnects CAS ~2 min before it re-registers SIP)."""
+    try:
+        tmp = PHONE_IPS_JSON + ".tmp"
+        with open(tmp, "w") as f: json.dump(PHONE_IPS, f, indent=1)
+        os.replace(tmp, PHONE_IPS_JSON)
+    except Exception as e: log("save phone ips err " + repr(e))
+def load_phone_ips():
+    try:
+        with open(PHONE_IPS_JSON) as f: d = json.load(f)
+        if isinstance(d, dict): PHONE_IPS.update({norm_mac(k) or k: v for k, v in d.items()})
+    except Exception: pass
 
 def register_phone(conn, hdrs, addr):
     """Handle a phone REGISTER: identify by MAC, attach its connection; unknown MACs go to SEEN for the UI."""
@@ -465,7 +873,9 @@ def register_phone(conn, hdrs, addr):
     ct = uri_of(H(hdrs, "contact"))
     with pstate:
         CONNS[mac] = conn
+        changed = PHONE_IPS.get(mac) != addr[0]
         PHONE_IPS[mac] = addr[0]            # so CAS (a separate connection) can map IP -> extension
+        if changed: save_phone_ips()
         if ct: CONTACTS[mac] = ct
         if mac in PHONES:
             SEEN.pop(mac, None); known = True
@@ -527,8 +937,21 @@ def phone_handle(conn, addr):
             if method == "REGISTER":
                 mymac = register_phone(conn, hdrs, addr)
                 conn.sendall(p_resp(200, "OK", hdrs, addr, method))
+                if mymac: threading.Timer(2.0, push_mwi_to_phone, args=(mymac,)).start()
             elif method == "INVITE":
-                threading.Thread(target=phone_invite, args=(conn, mymac, hdrs, b, addr), daemon=True).start()
+                cs = CALLS.get(H(hdrs, "call-id"))
+                if cs and cs.alive and ";tag=" in H(hdrs, "to"):  # in-dialog re-INVITE (hold/resume/refresh)
+                    try: phone_reinvite(conn, cs, hdrs, b, addr)
+                    except Exception as e: log(f"phone re-INVITE err {e!r}")
+                else:
+                    threading.Thread(target=phone_invite, args=(conn, mymac, hdrs, b, addr), daemon=True).start()
+            elif method == "SUBSCRIBE":
+                ev = H(hdrs, "event")
+                log(f"phone {mymac} SUBSCRIBE Event: {ev} Accept: {H(hdrs, 'accept')[:120]}")
+                if ev.split(";")[0].strip().lower() == "ua-profile":
+                    threading.Thread(target=ua_profile_subscribe, args=(conn, mymac, hdrs, addr), daemon=True).start()
+                else:
+                    conn.sendall(p_resp(200, "OK", hdrs, addr, method))
             elif method == "BYE":
                 cs = CALLS.get(H(hdrs, "call-id"))
                 conn.sendall(p_resp(200, "OK", hdrs, addr, method))
@@ -651,6 +1074,111 @@ def cas_user_name(ext, label):
 
 UNAUTH = object()   # sentinel: make cas_handle answer HTTP 401 (forces the phone to re-login)
 
+# ---- Options-menu PIN ("voicemail password" prompt) ----
+# The phone sends md5(PIN digits) as lowercase hex in "pwd". Each phone's PIN is kept
+# the same way in phones.json ("tui_pwd_md5"). No PIN set -> any PIN opens Options
+# (never lock the user out). 5 wrong tries -> Options locked for 5 minutes.
+PIN_FAILS = {}               # mac -> [fail_count, locked_until]
+PIN_MAX_FAILS, PIN_LOCK_SECS = 5, 300
+def _is_md5(v): return isinstance(v, str) and re.fullmatch(r"[0-9a-fA-F]{32}", v or "") is not None
+def pin_md5(pin): return hashlib.md5(str(pin).encode()).hexdigest()
+
+def cas_pin(msg, req, ext):
+    rid_ = req.get("request-id", 0)
+    ok = {"request-id": rid_, "topic": "config", "message": msg, "response": 0, "error": 0}
+    bad = {"request-id": rid_, "topic": "config", "message": msg, "response": 1, "error": 1,
+           "error-message": "Invalid password", "results": {}}
+    mac = mac_for_ext(ext) if ext else None
+    if not mac:
+        log(f"CAS {msg}: unidentified phone -> refused")
+        return bad
+    with pstate: stored = PHONES.get(mac, {}).get("tui_pwd_md5", "")
+    if msg == "authenticate-tui-pwd":
+        fails, until = PIN_FAILS.get(mac, [0, 0])
+        if until > time.time():
+            log(f"CAS PIN check {mac}: locked out for {int(until - time.time())}s more"); return bad
+        given = str(req.get("pwd", "")).lower()
+        if not stored or given == stored.lower():
+            PIN_FAILS.pop(mac, None)
+            log(f"CAS PIN check {mac}: accepted" + ("" if stored else " (no PIN set)"))
+            return {**ok, "results": {"must-change": False}, "must-change": False}
+        fails += 1
+        PIN_FAILS[mac] = [fails, time.time() + PIN_LOCK_SECS if fails >= PIN_MAX_FAILS else 0]
+        log(f"CAS PIN check {mac}: WRONG PIN ({fails}/{PIN_MAX_FAILS})"
+            + (" -> locked 5 min" if fails >= PIN_MAX_FAILS else ""))
+        return bad
+    # set-tui-pwd: field names not known yet -> log keys only (never values), take the
+    # md5 that looks like the NEW pin, and require the old one when a PIN is set.
+    log(f"CAS set-tui-pwd {mac}: fields {sorted(k for k in req if k not in ('request-id','topic','message'))}")
+    hashes = {k: str(v).lower() for k, v in req.items() if _is_md5(v)}
+    new = next((v for k, v in hashes.items() if "new" in k), None)
+    old = next((v for k, v in hashes.items() if "old" in k or "cur" in k), None)
+    if new is None and len(hashes) == 1: new = next(iter(hashes.values()))
+    if not new:
+        log(f"CAS set-tui-pwd {mac}: no new PIN found in request -> refused"); return bad
+    if stored and old is not None and old != stored.lower():
+        log(f"CAS set-tui-pwd {mac}: old PIN wrong -> refused"); return bad
+    with pstate:
+        if mac in PHONES: PHONES[mac]["tui_pwd_md5"] = new
+    save_phones(); PIN_FAILS.pop(mac, None)
+    log(f"CAS set-tui-pwd {mac}: PIN changed from the phone")
+    return {**ok, "results": {}}
+
+def cas_set_prog_buttons(req, ext):
+    """Phone's Options > Programmable Keys: store the button(s) in the phone's layout
+    (columnar CAS rows) and regenerate its config so it survives the next reload."""
+    rid_ = req.get("request-id", 0)
+    ok = {"request-id": rid_, "topic": "config", "message": "set-prog-buttons", "response": 0,
+          "error": 0, "results": {}}
+    mac = mac_for_ext(ext) if ext else None
+    rows = req.get("buttons") or []
+    if not mac or not rows or not isinstance(rows[0], list):
+        log(f"CAS set-prog-buttons: {'unidentified phone' if not mac else 'no rows'}"); return ok
+    hdr = rows[0]; saved = []
+    for r in rows[1:]:
+        f = dict(zip(hdr, r))
+        try: num = int(f.get("button-num", 0))
+        except Exception: continue
+        if num < 1: continue
+        if f.get("btn-box"):
+            try: box = max(1, int(f.get("dev-order", 1)))
+            except Exception: box = 1
+            sk = bb_sk(box, num)
+        else:
+            sk = num
+        try: func = int(f.get("func-id", 1))
+        except Exception: func = 1
+        with pstate:
+            btns = PHONES.get(mac, {}).setdefault("buttons", {})
+            if func in (0, 1): btns.pop(str(sk), None)
+            else:
+                btns[str(sk)] = {"func": func, "target": str(f.get("target", "")),
+                                 "target2": str(f.get("target2", "")),
+                                 "label": str(f.get("label") or f.get("long-label") or ""),
+                                 "long": str(f.get("long-label") or f.get("label") or "")}
+        saved.append(f"SK={sk} {PROG_FUNC_NAMES.get(func, func)} {f.get('target', '')}")
+    save_phones()
+    try: write_phoneconfig()
+    except Exception as e: log(f"phoneconfig rewrite failed: {e!r}")
+    log(f"CAS set-prog-buttons {mac}: stored {', '.join(saved) or 'nothing'} (the phone keeps it locally; bridge only records it)")
+    return ok
+
+CAS_OVERRIDES_JSON = os.path.join(DATA, "cas_overrides.json")
+def cas_override(topic, msg, rid_):
+    """Reply for "<topic>/<message>" from cas_overrides.json, re-read on every request
+    so reply shapes can be tried without a restart. "$rid" is replaced by the
+    request-id. No file / no entry -> None (normal handling)."""
+    try:
+        with open(CAS_OVERRIDES_JSON) as f: table = json.load(f)
+    except Exception: return None
+    tpl = table.get(f"{topic}/{msg}")
+    if not isinstance(tpl, dict): return None
+    def fill(v):
+        if isinstance(v, dict): return {k: fill(x) for k, x in v.items()}
+        if isinstance(v, list): return [fill(x) for x in v]
+        return rid_ if v == "$rid" else v
+    return fill(tpl)
+
 def _session_ok(target):
     sid = parse_qs(urlparse(target).query).get("SessionId", [""])[0]
     with CAS_LOCK:
@@ -692,11 +1220,32 @@ def cas_dispatch(method, target, body, client_ip=""):
             return UNAUTH
         try: req = json.loads(body or "{}")
         except Exception: req = {}
+        # The phone batches requests as a JSON array (e.g. two history get-recs after a
+        # call). Answer each one and return an array. Previously this crashed the
+        # handler, the phone got no reply and fell into a re-login loop.
+        if isinstance(req, list):
+            return [cas_dispatch(method, target, json.dumps(x), client_ip)
+                    for x in req if isinstance(x, dict)]
+        if not isinstance(req, dict): req = {}
         topic, msg = req.get("topic"), req.get("message")
         rid_ = req.get("request-id", 0)
         log(f"CAS Execute topic={topic} message={msg}")
+        if topic == "config" and msg in ("authenticate-tui-pwd", "set-tui-pwd"):
+            return cas_pin(msg, req, ext)
+        if topic == "config" and msg == "set-prog-buttons":
+            return cas_set_prog_buttons(req, ext)
+        ov = cas_override(topic, msg, rid_)       # hot-editable reply (cas_overrides.json)
+        if ov is not None:
+            log(f"CAS {topic}/{msg} -> override reply: {json.dumps(ov)[:300]}")
+            return ov
         if topic == "find":
             return cas_find_response(req)
+        if topic == "tel" and msg == "reset-missed-call-count":
+            log("CAS reset-missed-call-count -> ok")
+            return {"request-id": rid_, "topic": topic, "message": msg, "response": 0}
+        if topic == "history":                     # call log -> phone History screen
+            return cas_history_response(req, ext,
+                                        parse_qs(urlparse(target).query).get("SessionId", [""])[0])
         first, last = _split_name(label or ext or "")
         eprops = {"ext": ext, "did": ext, "firstname": first, "lastname": last,
                   "firstName": first, "lastName": last, "display-name": (label or ext),
@@ -797,8 +1346,10 @@ def cas_handle(conn, addr):
                 b"Content-Length: %d\r\nConnection: %s\r\n\r\n%s"
                 % (len(payload), b"keep-alive" if keep else b"close", payload))
             if not keep: break
+    except (ConnectionResetError, BrokenPipeError, socket.timeout, ssl.SSLError) as e:
+        if DEBUG: log("CAS err " + repr(e))         # phone hung up / long-poll ended: normal
     except Exception as e:
-        if DEBUG: log("CAS err " + repr(e))
+        log("CAS err " + repr(e))                   # real handler bug: always log
     finally:
         try: conn.close()
         except Exception: pass
@@ -843,7 +1394,8 @@ def inbound_invite(xh, xraw, xaddr):
         log(f"inbound for ext {ext}: no phone online"); u3.sendto(resp_line(480, "Unavailable", xh).encode(), xaddr); return
     fm = re.search(r'sips?:([^@>;]+)', H(xh, "from")); caller = fm.group(1) if fm else "unknown"
     cs = CallSession("inbound", conn, mac, ext, "", "")
-    cs.x_callid = H(xh, "call-id"); cs.x_rtp = sdp_media(xbody)
+    cs.direction = "in"; cs.peer = caller
+    cs.x_callid = H(xh, "call-id"); cs.x_rtp = sdp_media(xbody); cs.pbx_te = sdp_te_pt(xbody) or 101
     cs.p_callid = rid(16) + "@" + MYIP; cs.p_ftag = rid(8)
     CALLS[cs.x_callid] = cs; CALLS[cs.p_callid] = cs
     with pstate:
@@ -891,6 +1443,7 @@ def inbound_invite(xh, xraw, xaddr):
     if code >= 300:
         u3.sendto(resp_line(486, "Busy Here", xh).encode(), xaddr); cs.teardown(); return
     _, ph, pb = parse(final); cs.phone_rtp = sdp_media(pb); cs.p_totag = H(ph, "to")
+    cs.phone_te = sdp_te_pt(pb) or 102
     ack = ("\r\n".join([
         f"ACK {phone_uri} SIP/2.0", f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)}",
         "Max-Forwards: 70", f"From: <sips:{caller}@{MYIP}>;tag={cs.p_ftag}", f"To: {cs.p_totag}",
@@ -899,7 +1452,7 @@ def inbound_invite(xh, xraw, xaddr):
     except Exception: pass
     threading.Thread(target=cs.relay, daemon=True).start()
     osdp = ("v=0\r\n" f"o=bridge 1 1 IN IP4 {MYIP}\r\n" "s=call\r\n" f"c=IN IP4 {MYIP}\r\n" "t=0 0\r\n"
-            f"m=audio {cs.rp3} RTP/AVP 0 101\r\n" "a=rtpmap:0 PCMU/8000\r\n" "a=rtpmap:101 telephone-event/8000\r\n" "a=sendrecv\r\n")
+            f"m=audio {cs.rp3} RTP/AVP 0 {cs.pbx_te}\r\n" "a=rtpmap:0 PCMU/8000\r\n" f"a=rtpmap:{cs.pbx_te} telephone-event/8000\r\n" "a=sendrecv\r\n")
     ob = osdp.encode(); to2 = H(xh, "to")
     if ";tag=" not in to2: to2 = to2 + ";tag=" + mktag(cs.x_callid + "in")
     L = [f"SIP/2.0 200 OK"] + allvia(xh) + allrr(xh) + [f"From: {H(xh,'from')}", f"To: {to2}",
@@ -912,6 +1465,7 @@ def inbound_invite(xh, xraw, xaddr):
     cs.p_dialog = {'ruri': phone_uri, 'transport': 'TLS', 'lport': 5061,
                    'local': f"<sips:{caller}@{MYIP}>", 'ltag': cs.p_ftag, 'remote': cs.p_totag,
                    'callid': cs.p_callid, 'route': [], 'cseq': 1, 'conn': conn}
+    cs.t_up = time.time()
     log(f"inbound call up: {caller} <-> ext {ext}")
 
 def xaddr_ip(conn):
@@ -1003,6 +1557,64 @@ def send_to_phone_csta(mac, body):
     if out: log(f"CSTA << phone {mac}:\n{out.strip()}")
     return out or "(no reply from phone in 5s)"
 
+def send_to_phone_notify(mac, event, ctype, body, from_user="switch"):
+    """DEBUG: send an arbitrary out-of-dialog NOTIFY to a phone and return its reply."""
+    conn = CONNS.get(mac); contact = CONTACTS.get(mac)
+    if not conn or not contact:
+        return "(phone not connected)"
+    callid = rid(16) + "@" + MYIP; b = body.encode()
+    msg = ("\r\n".join([
+        f"NOTIFY {contact} SIP/2.0",
+        f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)};rport", "Max-Forwards: 70",
+        f"From: <sips:{from_user}@{MYIP}>;tag={rid(8)}", f"To: <{contact}>",
+        f"Call-ID: {callid}", "CSeq: 1 NOTIFY", f"Event: {event}", "Subscription-State: active;expires=3600",
+        f"Contact: <sips:switch@{MYIP}:5061;transport=tls>",
+        f"Content-Type: {ctype}", f"Content-Length: {len(b)}"]) + "\r\n\r\n").encode() + b
+    with pinlock: PIN[callid] = []
+    log(f"DEBUG NOTIFY >> phone {mac}: Event {event}, {ctype}, {len(b)} bytes")
+    try: conn.sendall(msg)
+    except Exception as e:
+        with pinlock: PIN.pop(callid, None)
+        return f"(send error: {e})"
+    end = time.time() + 5; out = None
+    while time.time() < end:
+        with pinlock: q = list(PIN.get(callid, []))
+        if q: out = q[-1]; break
+        time.sleep(0.05)
+    with pinlock: PIN.pop(callid, None)
+    first = (out or "").split("\r\n")[0]
+    log(f"DEBUG NOTIFY << phone {mac}: {first or '(no reply in 5s)'}")
+    return out or "(no reply from phone in 5s)"
+
+def reboot_phone(mac, when=None):
+    """Tell a connected phone to reboot via an unsolicited SIP-NOTIFY
+    'Event: reboot;when=<immediate|on-idle>'. Firmware-verified: NotifyClr::
+    EvUnhandledRequest matches event 'reboot' and reads the 'when' Event-header param
+    (handlePphoneRebootEvent). 'on-idle' defers until the phone has no active call."""
+    when = (when or REBOOT_WHEN).strip().lower()
+    if when not in ("immediate", "on-idle"): when = "on-idle"
+    if mac not in CONNS or mac not in CONTACTS:
+        log(f"reboot {mac}: phone not connected"); return "(phone not connected)"
+    log(f"reboot -> phone {mac}: when={when}")
+    return send_to_phone_notify(mac, f"reboot;when={when}", "text/plain", "", "switch")
+
+def reboot_all_phones(when=None):
+    macs = [m for m in list(CONNS.keys()) if m in CONTACTS]
+    if not macs: log("reboot-all: no connected phones"); return
+    log(f"reboot-all: notifying {len(macs)} phone(s) (when={(when or REBOOT_WHEN)})")
+    for m in macs:
+        try: reboot_phone(m, when)
+        except Exception as e: log(f"reboot {m} err: {e!r}")
+
+def _on_shutdown(signum, frame):
+    """SIGTERM/SIGINT: optionally reboot connected phones before the bridge exits."""
+    log(f"shutdown signal {signum}" + (f"; rebooting phones (when={REBOOT_WHEN})" if REBOOT_ON_RESTART else ""))
+    if REBOOT_ON_RESTART:
+        try: reboot_all_phones()
+        except Exception as e: log(f"shutdown reboot err: {e!r}")
+        time.sleep(1.5)   # give the NOTIFYs time to go out and be ACKed before we exit
+    sys.exit(0)
+
 # ----------------------------- HTTP config/cert server (port 80) -----------------------------
 class QuietHTTP(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a):
@@ -1036,7 +1648,7 @@ def write_phoneconfig():
         first, last = _split_name(label or ext or "")
         b = "[user]\n"
         if with_tz: b += f"timezone={TZ}\n"
-        return b + f"userFirstName={first}\nuserLastName={last}\n"
+        return b + f"userFirstName={first}\nuserLastName={last}\nallowPhoneButtonCustomization=true\n"
     one_ext = one_label = ""
     if len(PHONES) == 1:
         _one = next(iter(PHONES.values()))
@@ -1044,18 +1656,115 @@ def write_phoneconfig():
         one_label = _one.get("label", "")
     open(os.path.join(d, "custom.txt"), "w").write(
         sip_block(one_ext) + cas_block + user_block(one_label, one_ext, with_tz=True))
+    # Per-MODEL config layer. The phone fetches custom_<MODEL>.txt (e.g. custom_IP485g.txt)
+    # between custom.txt and custom_<MAC>.txt (seen in a 2026-11-10 capture -- we were
+    # 404ing it). Serve the common sip/cas base + button customization so the layer exists.
+    open(os.path.join(d, "custom_IP485g.txt"), "w").write(
+        sip_block() + cas_block + "[user]\nallowPhoneButtonCustomization=true\n")
     # Per-MAC config (fetched as custom_<MAC>.txt after custom.txt) sets each phone's
     # own sipExtension and display name.
     for mac, p in list(PHONES.items()):
         ext = str(p.get("extension", "")).strip()
         if not ext: continue
         open(os.path.join(d, f"custom_{mac.upper()}.txt"), "w").write(
-            sip_block(ext) + user_block(p.get("label", ""), ext))
+            sip_block(ext) + user_block(p.get("label", ""), ext) + p8_extra_blocks(p))
     cu = os.path.join(d, "country_US.txt")
     if not os.path.exists(cu):
         open(cu, "w").write('[site]\ndateFormatLong="\\\\a, \\\\b \\\\d \\\\Y"\n'
                             'timeFormatLong="\\\\h:\\\\m\\\\p"\ndateFormatShort="\\\\n/\\\\d/\\\\Y"\n'
                             'timeFormatShort="\\\\h:\\\\m\\\\p"\n')
+
+# The Voicemail key dials "micloud voicemailloginextension", which the firmware only
+# writes from ua-profile subscription data (UaProfSvc::EvUpdated -> PhUaProfMgr::
+# UpdateSvcData). .txt keys, Aastra-style lines and unsolicited ua-profile NOTIFYs all
+# had no effect (tested 2026-11-09). Kept so that if the phone ever SUBSCRIBEs to
+# ua-profile, it gets the voicemail number.
+def ua_profile_body(mac):
+    """[user] block delivered through a ua-profile subscription -> PhUaProfMgr::
+    UpdateSvcData; unknown keys become "micloud <key>" (lowercase is significant)."""
+    lines = ["[user]"]
+    if VM_NUMBER:
+        lines += [f"voicemailloginextension={VM_NUMBER}", f"voicemailextension={VM_NUMBER}"]
+    return "\n".join(lines) + "\n"
+
+def ua_profile_subscribe(conn, mac, hdrs, addr):
+    """Accept the phone's ua-profile SUBSCRIBE, then NOTIFY inside that dialog."""
+    totag = mktag(H(hdrs, "call-id") + "srv")       # same tag p_resp puts on the 200 OK
+    r = p_resp(200, "OK", hdrs, addr, "SUBSCRIBE")
+    conn.sendall(r)
+    time.sleep(0.3)
+    body = ua_profile_body(mac).encode()
+    acc = H(hdrs, "accept").split(",")[0].strip() or "text/plain"
+    ct = uri_of(H(hdrs, "contact")) or CONTACTS.get(mac, "")
+    to_hdr = H(hdrs, "from")                       # their From becomes our To
+    frm = H(hdrs, "to")
+    if ";tag=" not in frm: frm += ";tag=" + totag
+    L = [f"NOTIFY {ct} SIP/2.0", f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)};rport",
+         "Max-Forwards: 70", f"From: {frm}", f"To: {to_hdr}", f"Call-ID: {H(hdrs, 'call-id')}",
+         "CSeq: 1 NOTIFY", f"Event: {H(hdrs, 'event')}", "Subscription-State: active;expires=3600",
+         f"Contact: <sips:switch@{MYIP}:5061;transport=tls>",
+         f"Content-Type: {acc}", f"Content-Length: {len(body)}"]
+    with pinlock: PIN[H(hdrs, "call-id")] = []
+    conn.sendall(("\r\n".join(L) + "\r\n\r\n").encode() + body)
+    end = time.time() + 5; reply = None
+    while time.time() < end and not reply:
+        with pinlock: q = [m for m in PIN.get(H(hdrs, "call-id"), []) if "NOTIFY" in H(parse(m)[1], "cseq")]
+        if q: reply = q[-1]
+        time.sleep(0.05)
+    with pinlock: PIN.pop(H(hdrs, "call-id"), None)
+    log(f"ua-profile NOTIFY to {mac} ({acc}, {len(body)} bytes): "
+        + ((reply or "").split("\r\n")[0] or "no reply"))
+
+# ---- programmable buttons / BB424 (804 firmware p8_phone ProgrammableButtonsDM) ----
+# [progbuttons] holds one value: ';'-separated records, each starting "SK=<n>".
+# n = line+1; line 0-15 = the phone's own keys, 16+24*(box-1)+btn = button box
+# keys, so BB424 #1 buttons 1-24 are SK=17..40 (translateLineToPair). Record:
+# SK=n;label;funcId;target;flag;ringDelay;noConnAction;connAction;stackPos;
+#      target2;papi;longLabel;   (field positions from ProgrammableButtonDM getters;
+# label/longLabel positions inferred). funcId = firmware EnumProgButton codes.
+PROG_FUNCS = [(1, "Unused"), (4, "Dial Number"), (5, "Dial Mailbox"), (2, "Call Appearance"),
+              (3, "Monitor Extension"), (6, "Intercom"), (10, "Pickup"), (11, "Unpark"),
+              (14, "Page"), (15, "Transfer Blind"), (16, "Transfer Consultative"),
+              (17, "Transfer To Mailbox"), (19, "Conference Blind"), (20, "Conference Consultative"),
+              (22, "Park"), (27, "Send Digits Over Call"), (60, "Toggle Handsfree"),
+              (87, "Lock/Unlock")]
+PROG_FUNC_NAMES = dict(PROG_FUNCS)
+BB_BUTTONS = 24
+PHONE_KEYS = 8                  # P8CGPhoneClr::populateProgrammableButtons builds 8 phone keys
+def bb_sk(box, btn):            # box 1-based, btn 1-based  -> SK index (after the phone's keys)
+    return PHONE_KEYS + BB_BUTTONS * (box - 1) + btn
+def _clean(v, n=32):             # no record/field separators inside values
+    return re.sub(r"[;\r\n]|SK=", "", str(v or ""))[:n]
+
+def progbuttons_block(p):
+    # NOT emitted. DISPROVEN 2026-11-09 by the speed-dial experiment + disassembly:
+    #  - The config loader path is ProgrammableButtonsDM::set(QSettings*) -> the single
+    #    call to configureDeviceButtons. It configures exactly ONE device.
+    #  - populateProgrammableButtons is the ONLY site that constructs a
+    #    ProgrammableButtonDeviceDM, and it builds ONE device of 8 buttons from locally
+    #    persisted state -- so even device 0 ignores the served [progbuttons] on reboot
+    #    (a phone-key speed dial written to custom_<MAC>.txt did NOT appear).
+    # The phone owns its button state locally and reports changes up via config::
+    # set-prog-buttons; the BB424 is never built as a button device from any served config.
+    # Kept only to render the stored layout if a live push path is ever found.
+    btns = dict(p.get("buttons") or {})
+    recs = []
+    for sk in sorted(btns, key=lambda k: int(k)):
+        b = btns[sk]
+        try: func = int(b.get("func", 1))
+        except Exception: func = 1
+        lab = _clean(b.get("label"), 16); lng = _clean(b.get("long") or b.get("label"), 32)
+        recs.append(";".join([f"SK={int(sk)}", lab, str(func), _clean(b.get("target"), 40), "0", "-1",
+                              "0", "0", "0", _clean(b.get("target2"), 40), "", lng, ""]))
+    return (f"[progbuttons]\nbboxCount=1\nbuttons=" + ";".join(recs) + "\n") if recs else ""
+
+def p8_extra_blocks(p=None):
+    """Extra pphone.conf keys served per phone. SysConfigDM.voiceMailLoginExtension
+    (exact case) is what the Voicemail key dials -- works. [progbuttons] is intentionally
+    NOT emitted: disassembly + the 2026-11-09 speed-dial test proved the phone builds its
+    8 keys from locally persisted state (not the served file) and never builds a button
+    device for the BB424, so emitting it only risks disturbing the phone's own keys."""
+    return f"[system]\nvoiceMailLoginExtension={VM_NUMBER}\n" if VM_NUMBER else ""
 
 def http_server():
     write_phoneconfig()
@@ -1066,38 +1775,70 @@ def http_server():
     httpd.serve_forever()
 
 # ----------------------------- admin web UI (port UI_PORT) -----------------------------
-PAGE = """<!doctype html><html><head><meta charset=utf-8><title>shorebridge</title>
-<style>
-body{{font:15px system-ui,sans-serif;margin:2rem;max-width:820px;color:#222}}
-h1{{font-size:1.4rem}} h2{{font-size:1.05rem;margin-top:1.8rem;color:#444}}
-table{{border-collapse:collapse;width:100%}} td,th{{padding:.45rem .6rem;border-bottom:1px solid #eee;text-align:left}}
-.on{{color:#0a0;font-weight:600}} .off{{color:#999}}
-input{{padding:.35rem;border:1px solid #ccc;border-radius:4px}}
-button{{padding:.35rem .8rem;border:0;border-radius:4px;background:#2563eb;color:#fff;cursor:pointer}}
-button.d{{background:#ddd;color:#333}}
-.card{{background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:1rem;margin:.6rem 0}}
-small{{color:#888}}
-</style></head><body>
-<h1>shorebridge <small>{ip}</small> <a href=/ style="font-size:.8rem;font-weight:400">&#8635; refresh</a></h1>
-<p><small>{connstatus}</small></p>
+CSS = """
+:root{{--bg:#f1f5f9;--card:#fff;--ink:#1e293b;--muted:#64748b;--line:#e2e8f0;--blue:#2563eb}}
+*{{box-sizing:border-box}}
+body{{font:15px system-ui,sans-serif;margin:0;background:var(--bg);color:var(--ink)}}
+.wrap{{max-width:900px;margin:0 auto;padding:1.5rem}}
+h1{{font-size:1.3rem;margin:0}} h2{{font-size:1.02rem;margin:1.4rem 0 .5rem;color:var(--ink)}}
+a{{color:var(--blue)}} small{{color:var(--muted)}}
+table{{border-collapse:collapse;width:100%;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}}
+td,th{{padding:.5rem .7rem;border-bottom:1px solid var(--line);text-align:left}}
+tr:last-child td{{border-bottom:0}}
+th{{background:#f8fafc;font-size:.8rem;text-transform:uppercase;letter-spacing:.03em;color:var(--muted)}}
+.on{{color:#16a34a;font-weight:600}} .off{{color:#94a3b8}}
+input,select{{padding:.4rem;border:1px solid #cbd5e1;border-radius:6px;font:inherit}}
+button{{padding:.4rem .85rem;border:0;border-radius:6px;background:var(--blue);color:#fff;cursor:pointer;font:inherit}}
+button.d{{background:#e2e8f0;color:#334155}} button.ghost{{background:#eef2ff;color:var(--blue)}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:1rem;margin:.7rem 0}}
+.card table,.card tr:last-child td{{border:0}} .card td{{border-bottom:0;padding:.3rem .4rem}}
+.bar{{display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;margin-bottom:.3rem}}
+.status{{color:var(--muted);font-size:.9rem;margin:.2rem 0 1rem}}
+.tabbar{{display:flex;gap:.3rem;border-bottom:2px solid var(--line);margin-bottom:1rem;flex-wrap:wrap}}
+.tabbar button{{background:none;color:var(--muted);border-radius:8px 8px 0 0;padding:.5rem 1rem;font-weight:600;border-bottom:2px solid transparent;margin-bottom:-2px}}
+.tabbar button.active{{color:var(--blue);border-bottom-color:var(--blue)}}
+"""
+PAGE = ("""<!doctype html><html><head><meta charset=utf-8><title>shorebridge</title>
+<style>""" + CSS + """</style></head><body><div class=wrap>
+<div class=bar><h1>shorebridge <small>{ip}</small></h1><a href=/>&#8635; refresh</a></div>
+<p class=status>{connstatus}</p>
+<div class=tabbar>
+<button data-t=phones>Phones</button>
+<button data-t=calls>Recent calls</button>
+<button data-t=dir>Directory</button>
+</div>
+
+<section class=tab id=tab-phones>
 <h2>Configured phones</h2>
 <table><tr><th>MAC</th><th>Extension</th><th>Label</th><th>Online</th><th>Registered</th><th></th></tr>
 {rows}
 </table>
 {discovered}
-<h2>Add / update a phone</h2>
+<h2 id=phoneform>{formtitle}</h2>
 <form method=post action=/add class=card>
+<input type=hidden name=orig_mac value="{orig_mac}">
 <table>
 <tr><td>MAC</td><td><input name=mac value="{addmac}" placeholder="00:10:49:54:3b:4c" required></td></tr>
 {catalog}
-<tr><td>Extension</td><td><input name=extension placeholder="number"></td></tr>
-<tr><td>Auth ID</td><td><input name=auth_id placeholder="(blank = same as extension)"></td></tr>
-<tr><td>Password</td><td><input name=password type=password></td></tr>
-<tr><td>Label / name</td><td><input name=label placeholder="Front desk"></td></tr>
+<tr><td>Extension</td><td><input name=extension value="{ext_val}" placeholder="number"></td></tr>
+<tr><td>Auth ID</td><td><input name=auth_id value="{auth_val}" placeholder="(blank = same as extension)"></td></tr>
+<tr><td>Password</td><td><input name=password type=password placeholder="{pw_hint}"></td></tr>
+<tr><td>Label / name</td><td><input name=label value="{label_val}" placeholder="Front desk"></td></tr>
+<tr><td>Options PIN</td><td><input name=tui_pin type=password inputmode=numeric pattern="[0-9]*" placeholder="{pin_hint}">
+<label style="margin-left:.6rem"><input type=checkbox name=tui_pin_clear value=1> clear PIN</label></td></tr>
 </table>
-<p><button type=submit>Save phone</button></p>
+<p><button type=submit>Save phone</button> {cancel}</p>
 </form>
+</section>
 
+<section class=tab id=tab-calls hidden>
+<h2>Recent calls <small>(served to the phones' History)</small></h2>
+<table><tr><th>When</th><th></th><th>Number</th><th>Name</th><th>Ext</th><th>Duration</th></tr>
+{calls}
+</table>
+</section>
+
+<section class=tab id=tab-dir hidden>
 <h2>Directory contacts <small>(name + number only, no phone)</small></h2>
 <table><tr><th>Name</th><th>Number</th><th>Type</th><th></th></tr>
 {directory}
@@ -1113,8 +1854,23 @@ small{{color:#888}}
 </table>
 <p><button type=submit>Add contact</button></p>
 </form>
-<p><small>Shown in every phone's Directory alongside registered phones. Edits apply immediately. Config: {cfg}</small></p>
+<p><small>Shown in every phone's Directory alongside registered phones. Edits apply immediately.</small></p>
+</section>
+
+<p class=status>Config: {cfg}</p>
+</div>
 <script>
+function showTab(id){{
+  document.querySelectorAll('.tab').forEach(function(s){{s.hidden=(s.id!='tab-'+id);}});
+  document.querySelectorAll('.tabbar button').forEach(function(b){{b.classList.toggle('active',b.dataset.t==id);}});
+  try{{localStorage.setItem('sb_tab',id);}}catch(e){{}}
+}}
+(function(){{
+  var t='phones';
+  if(!/[?&](edit|add)=/.test(location.search)){{try{{t=localStorage.getItem('sb_tab')||'phones';}}catch(e){{}}}}
+  showTab(t);
+}})();
+document.querySelectorAll('.tabbar button').forEach(function(b){{b.addEventListener('click',function(){{showTab(b.dataset.t);}});}});
 // auto-refresh to surface newly-seen phones, but never while you're typing in a field
 setInterval(function(){{
   var a=document.activeElement;
@@ -1122,7 +1878,7 @@ setInterval(function(){{
   location.reload();
 }}, 8000);
 </script>
-</body></html>"""
+</body></html>""")
 
 def render():
     with pstate:
@@ -1131,10 +1887,18 @@ def render():
             online = mac in CONNS
             reg = REGOK.get(p["extension"], False)
             rows.append(
-                f"<tr><td><code>{mac}</code></td><td>{p['extension']}</td><td>{p.get('label','')}</td>"
+                f"<tr><td><code>{mac}</code></td><td>{html.escape(str(p['extension']))}</td>"
+                f"<td>{html.escape(p.get('label',''))}</td>"
                 f"<td class={'on' if online else 'off'}>{'online' if online else 'offline'}</td>"
                 f"<td class={'on' if reg else 'off'}>{'yes' if reg else 'no'}</td>"
-                f"<td><form method=post action=/delete style=margin:0>"
+                f"<td style=white-space:nowrap><form method=get style='display:inline;margin:0'>"
+                f"<input type=hidden name=edit value='{mac}'><button>edit</button></form> "
+                f"<form method=get action=/buttons style='display:inline;margin:0'>"
+                f"<input type=hidden name=mac value='{mac}'><button>BB424</button></form> "
+                + (f"<form method=post action=/reboot style='display:inline;margin:0' "
+                   f"onsubmit=\"return confirm('Reboot this phone? It will drop any active call and take ~1-2 min.')\">"
+                   f"<input type=hidden name=mac value='{mac}'><button class=ghost>reboot</button></form> " if online else "")
+                + f"<form method=post action=/delete style='display:inline;margin:0'>"
                 f"<input type=hidden name=mac value='{mac}'><button class=d>remove</button></form></td></tr>")
         seen = {m: v for m, v in SEEN.items() if m not in PHONES}
     rowhtml = "".join(rows) or "<tr><td colspan=6><small>none yet</small></td></tr>"
@@ -1169,15 +1933,99 @@ def render():
 class AdminHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         if DEBUG: super().log_message(*a)
-    def _page(self, addmac=""):
+    def _page(self, addmac="", edit=""):
         rowhtml, disc, catalog, connstatus, dirhtml = render()
-        html = PAGE.format(ip=MYIP, rows=rowhtml, discovered=disc, addmac=addmac,
-                           cfg=PHONES_JSON, catalog=catalog, connstatus=connstatus, directory=dirhtml)
+        e = html.escape
+        with pstate: cur = dict(PHONES.get(edit, {})) if edit else {}
+        if cur:                                    # edit mode: pre-fill from the saved phone
+            form = dict(formtitle=f"Edit phone <code>{e(edit)}</code>", orig_mac=e(edit), addmac=e(edit),
+                        ext_val=e(str(cur.get("extension", ""))), auth_val=e(str(cur.get("auth_id", ""))),
+                        label_val=e(cur.get("label", "")), pw_hint="(blank = keep current password)",
+                        pin_hint=("set - blank keeps it" if cur.get("tui_pwd_md5") else "none - any PIN opens Options"),
+                        cancel="<a href=/>cancel</a>")
+        else:
+            form = dict(formtitle="Add a phone", orig_mac="", addmac=e(addmac), ext_val="",
+                        auth_val="", label_val="", pw_hint="", cancel="",
+                        pin_hint="digits; blank = no PIN (any PIN opens Options)")
+        crow = []
+        for r in sorted(load_calllog(), key=lambda r: r.get("start", 0), reverse=True)[:15]:
+            kind = "missed" if r.get("missed") else ("&#8601; in" if r.get("direction") == "in" else "&#8599; out")
+            crow.append(f"<tr><td>{time.strftime('%b %d %H:%M', time.localtime(r.get('start', 0)))}</td>"
+                        f"<td>{kind}</td><td>{e(str(r.get('number','')))}</td><td>{e(r.get('name',''))}</td>"
+                        f"<td>{e(str(r.get('ext','')))}</td><td>{'' if r.get('missed') else str(r.get('duration',0))+'s'}</td></tr>")
+        callhtml = "".join(crow) or "<tr><td colspan=6><small>none yet</small></td></tr>"
+        page = PAGE.format(ip=MYIP, rows=rowhtml, discovered=disc, cfg=PHONES_JSON, catalog=catalog,
+                           connstatus=connstatus, directory=dirhtml, calls=callhtml, **form)
         self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
-        self.wfile.write(html.encode())
+        self.wfile.write(page.encode())
     def do_GET(self):
         q = parse_qs(urlparse(self.path).query)
-        self._page(addmac=q.get("add", [""])[0])
+        if urlparse(self.path).path == "/buttons":
+            return self._buttons_page(norm_mac(q.get("mac", [""])[0]) or "", q.get("saved", [""])[0])
+        self._page(addmac=q.get("add", [""])[0], edit=norm_mac(q.get("edit", [""])[0]) or "")
+    def _buttons_page(self, mac, saved=""):
+        e = html.escape
+        with pstate: p = dict(PHONES.get(mac, {}))
+        if not p:
+            self.send_response(302); self.send_header("Location", "/"); self.end_headers(); return
+        btns = p.get("buttons") or {}
+        def row(n):
+            b = btns.get(str(bb_sk(1, n)), {})
+            cur = int(b.get("func", 1) or 1)
+            opts = "".join(f"<option value={fid}{' selected' if fid == cur else ''}>{e(nm)}</option>"
+                           for fid, nm in PROG_FUNCS)
+            if cur not in PROG_FUNC_NAMES:
+                opts += f"<option value={cur} selected>code {cur}</option>"
+            return (f"<tr><td><b>{n}</b></td><td><select name=f{n}>{opts}</select></td>"
+                    f"<td><input name=t{n} value='{e(str(b.get('target','')))}' size=14 placeholder='number / ext'></td>"
+                    f"<td><input name=l{n} value='{e(str(b.get('label','')))}' size=12 maxlength=16 placeholder='label'></td></tr>")
+        left = "".join(row(n) for n in range(1, 13)); right = "".join(row(n) for n in range(13, 25))
+        hdr = "<tr><th>#</th><th>Function</th><th>Number</th><th>Label</th></tr>"
+        # Phone's own 8 keys (device 0, SK 1..8). Configuring any of these makes the
+        # bridge actually emit [progbuttons] -- the live experiment.
+        def prow(n):
+            b = btns.get(str(n), {})
+            cur = int(b.get("func", 1) or 1)
+            opts = "".join(f"<option value={fid}{' selected' if fid == cur else ''}>{e(nm)}</option>"
+                           for fid, nm in PROG_FUNCS)
+            if cur not in PROG_FUNC_NAMES:
+                opts += f"<option value={cur} selected>code {cur}</option>"
+            return (f"<tr><td><b>{n}</b></td><td><select name=pf{n}>{opts}</select></td>"
+                    f"<td><input name=pt{n} value='{e(str(b.get('target','')))}' size=14 placeholder='number / ext'></td>"
+                    f"<td><input name=pl{n} value='{e(str(b.get('label','')))}' size=12 maxlength=16 placeholder='label'></td></tr>")
+        phone_tbl = "".join(prow(n) for n in range(1, PHONE_KEYS + 1))
+        exp = ("<p class=card style='background:#fee2e2'><b>Config channel: disproven (2026-11-09).</b> "
+               "A speed dial written here to the phone's own key did <b>not</b> appear after a "
+               "reboot. Disassembly confirms why: the phone builds its 8 keys from "
+               "<b>locally persisted state</b>, not the served config, and the firmware never "
+               "builds a button device for the BB424. The bridge therefore <b>no longer emits</b> "
+               "<code>[progbuttons]</code> (it is ignored and only risks the phone's own keys). "
+               "Programming a key <b>on the phone itself</b> is the only path that sticks. These "
+               "tables remain a stored record / scratchpad in case a live CAS push path is found.</p>")
+        warn = ("<p class=card style='background:#fef3c7'><b>BB424 not working.</b> Only one "
+                "programmable-button device (the phone's 8 keys) is ever created by this "
+                "firmware; the box is never built from any served config. Populating it appears "
+                "to require a real ShoreTel/MiVoice switch, or a live CAS push we have not found.</p>")
+        note = ("<p class=card style='background:#ecfdf5'>Saved to the stored layout (not pushed to the phone).</p>"
+                if saved else "")
+        css = CSS.replace("{{", "{").replace("}}", "}") + ".cols{display:flex;gap:1.5rem;flex-wrap:wrap}.cols table{width:auto}"
+        page = f"""<!doctype html><html><head><meta charset=utf-8><title>Buttons - {e(p.get('label') or mac)}</title>
+<style>{css}</style></head><body><div class=wrap>
+<div class=bar><h1>Phone &amp; BB424 buttons <small>{e(p.get('label') or '')} &middot; ext {e(str(p.get('extension','')))} &middot; <code>{e(mac)}</code></small></h1><a href=/>&larr; back</a></div>
+{note}
+<form method=post action=/buttons-save>
+<input type=hidden name=mac value='{e(mac)}'>
+<h2>Phone keys (1&ndash;8) &mdash; speed-dial experiment</h2>
+{exp}
+<div class=cols><table>{hdr}{phone_tbl}</table></div>
+<h2>BB424 button box</h2>
+{warn}
+<div class=cols><table>{hdr}{left}</table><table>{hdr}{right}</table></div>
+<p><button type=submit>Save layout</button>
+<small>Phone keys 1&ndash;8 are the phone's own keys. BB424 buttons 1&ndash;12 are its left column, 13&ndash;24 the right.</small></p>
+</form></div></body></html>"""
+        self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+        self.wfile.write(page.encode())
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0)); body = self.rfile.read(n).decode()
         f = {k: v[0] for k, v in parse_qs(body).items()}
@@ -1189,6 +2037,15 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             reply = send_to_phone_csta(mac, xml)
             self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
             self.wfile.write(("SENT:\n" + xml + "\n\nREPLY:\n" + (reply or "") + "\n").encode()); return
+        if path == "/debug/notify" and DEBUG:
+            # body = raw payload; ?mac=&event=&ctype=&from=  (debug only)
+            q = parse_qs(urlparse(self.path).query)
+            mac = norm_mac(q.get("mac", [""])[0]) or next(iter(CONNS), "")
+            reply = send_to_phone_notify(mac, q.get("event", ["ua-profile"])[0],
+                                         q.get("ctype", ["text/plain"])[0], body,
+                                         q.get("from", ["switch"])[0])
+            self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
+            self.wfile.write((reply + "\n").encode()); return
         if path == "/debug/probe" and DEBUG:
             mac = norm_mac(f.get("mac", ""))
             out = csta_probe(mac)
@@ -1213,8 +2070,36 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
             self.wfile.write((f"pushed {len(events)} event(s) to ip={ip} sid={sid}\n"
                               f"(watch: shorebridge logs)\n").encode()); return
+        if path == "/buttons-save":
+            mac = norm_mac(f.get("mac", ""))
+            with pstate:
+                if mac in PHONES:
+                    btns = PHONES[mac].setdefault("buttons", {})
+                    for n in range(1, BB_BUTTONS + 1):
+                        sk = str(bb_sk(1, n))
+                        try: func = int(f.get(f"f{n}", "1"))
+                        except Exception: func = 1
+                        tgt = f.get(f"t{n}", "").strip(); lab = f.get(f"l{n}", "").strip()
+                        if func in (0, 1) and not tgt: btns.pop(sk, None)
+                        else: btns[sk] = {"func": func, "target": tgt, "label": lab, "long": lab}
+                    # phone's own keys (device 0, SK 1..8) -- the speed-dial experiment
+                    for n in range(1, PHONE_KEYS + 1):
+                        sk = str(n)
+                        try: func = int(f.get(f"pf{n}", "1"))
+                        except Exception: func = 1
+                        tgt = f.get(f"pt{n}", "").strip(); lab = f.get(f"pl{n}", "").strip()
+                        if func in (0, 1) and not tgt: btns.pop(sk, None)
+                        else: btns[sk] = {"func": func, "target": tgt, "label": lab, "long": lab}
+            save_phones()
+            try: write_phoneconfig()
+            except Exception as e: log(f"phoneconfig rewrite failed: {e!r}")
+            log(f"UI: saved button layout for {mac} (stored only; [progbuttons] not emitted)")
+            self.send_response(303); self.send_header("Location", f"/buttons?mac={mac}&saved=1"); self.end_headers()
+            return
         if path == "/add":
             mac = norm_mac(f.get("mac", ""))
+            orig = norm_mac(f.get("orig_mac", "")) or mac
+            with pstate: prev = dict(PHONES.get(orig) or PHONES.get(mac) or {})
             pick = f.get("catalog_ext", "").strip()
             rec = None
             if pick:
@@ -1222,15 +2107,28 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
                     rec = next((e for e in CATALOG if e.number == pick), None)
             ext = f.get("extension", "").strip() or (rec.number if rec else "")
             authid = f.get("auth_id", "").strip() or (rec.auth_id if rec else ext)
-            password = f.get("password", "") or (rec.password if rec else "")
+            password = f.get("password", "") or (rec.password if rec else "") or prev.get("password", "")
             label = f.get("label", "").strip() or (rec.display_name if rec else "")
             if mac and ext and password:
                 with pstate:
-                    PHONES[mac] = {"extension": ext, "auth_id": authid, "password": password, "label": label}
+                    if orig != mac: PHONES.pop(orig, None)      # MAC changed while editing
+                    PHONES[mac] = {**prev, "extension": ext, "auth_id": authid,
+                                   "password": password, "label": label}
+                    pin = re.sub(r"\D", "", f.get("tui_pin", ""))
+                    if f.get("tui_pin_clear"): PHONES[mac].pop("tui_pwd_md5", None)
+                    elif pin: PHONES[mac]["tui_pwd_md5"] = pin_md5(pin)
                     SEEN.pop(mac, None)
-                save_phones(); ensure_registrations(); log(f"UI: saved phone {mac} -> ext {ext}")
+                save_phones(); ensure_registrations()
+                try: write_phoneconfig()                       # push new ext/name to the phone's config files
+                except Exception as ex: log(f"UI: phoneconfig rewrite failed: {ex!r}")
+                log(f"UI: {'updated' if prev else 'saved'} phone {mac} -> ext {ext}")
             else:
                 log(f"UI: incomplete add for {mac} (need extension + password)")
+        elif path == "/reboot":
+            mac = norm_mac(f.get("mac", ""))
+            when = f.get("when", "").strip() or REBOOT_WHEN
+            log(f"UI: reboot phone {mac} (when={when})")
+            threading.Thread(target=reboot_phone, args=(mac, when), daemon=True).start()
         elif path == "/delete":
             mac = norm_mac(f.get("mac", ""))
             with pstate: PHONES.pop(mac, None)
@@ -1270,8 +2168,11 @@ def main():
     for p in (CERT, KEY, os.path.join(HTTP_ROOT, "keystore", "certs", "hq_ca.crt")):
         if not os.path.exists(p):
             sys.stderr.write(f"shorebridge: missing {p} (run the installer first)\n"); sys.exit(1)
-    load_phones()
-    log(f"shorebridge starting: bind={MYIP} pbx={SBC_IP}:{SBC_PORT} domain={DOMAIN} phones={len(PHONES)}")
+    load_phones(); load_phone_ips()
+    signal.signal(signal.SIGTERM, _on_shutdown)
+    signal.signal(signal.SIGINT, _on_shutdown)
+    log(f"shorebridge starting: bind={MYIP} pbx={SBC_IP}:{SBC_PORT} domain={DOMAIN} phones={len(PHONES)}"
+        + (f" (reboot phones on restart: when={REBOOT_WHEN})" if REBOOT_ON_RESTART else ""))
     ensure_registrations()
     threading.Thread(target=refresh_catalog, daemon=True).start()
     threading.Thread(target=http_server, daemon=True).start()

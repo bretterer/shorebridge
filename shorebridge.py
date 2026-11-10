@@ -114,6 +114,13 @@ def creds_for_mac(mac):
 def mac_for_ext(ext):
     for mac, p in PHONES.items():
         if p["extension"] == ext: return mac
+def mac_for_ip(ip):
+    """Reverse the MAC->IP map (populated at REGISTER). Lets an INVITE that arrives on a
+    TLS connection before this phone has REGISTERed on it still be identified, e.g. a
+    *97 dialed in the gap right after a bridge restart."""
+    if not ip: return None
+    for mac, pip in PHONE_IPS.items():
+        if pip == ip and mac in PHONES: return mac
     return None
 
 # ----------------------------- SIP helpers -----------------------------
@@ -429,6 +436,11 @@ def p_resp(code, reason, hdrs, addr, method, sdp=None):
 def phone_invite(conn, mac, hdrs, body, addr):
     to = H(hdrs, "to"); m = re.search(r'sips?:([^@>]+)@', to); dst = m.group(1) if m else "0"
     creds = creds_for_mac(mac)
+    if not creds:                                  # no MAC on this connection yet -> identify by source IP
+        alt = mac_for_ip(addr[0])
+        if alt:
+            log(f"INVITE with no MAC on connection; identified {alt} by IP {addr[0]}")
+            mac = alt; creds = creds_for_mac(mac)
     if not creds:
         log(f"unconfigured phone {mac} tried to dial {dst}")
         conn.sendall(p_resp(403, "Forbidden", hdrs, addr, "INVITE")); return
@@ -458,6 +470,20 @@ def phone_invite(conn, mac, hdrs, body, addr):
            "m=audio 0 RTP/SAVP 0\r\n")
     conn.sendall(p_resp(200, "OK", hdrs, addr, "INVITE", sdp=ans))
     log(f"call up: ext {ext} <-> {dst}")
+PHONE_IPS_JSON = os.path.join(DATA, "phone_ips.json")
+def save_phone_ips():
+    """Persist MAC -> last IP so that right after a bridge restart CAS can still tell
+    which phone is talking (the phone reconnects CAS ~2 min before it re-registers SIP)."""
+    try:
+        tmp = PHONE_IPS_JSON + ".tmp"
+        with open(tmp, "w") as f: json.dump(PHONE_IPS, f, indent=1)
+        os.replace(tmp, PHONE_IPS_JSON)
+    except Exception as e: log("save phone ips err " + repr(e))
+def load_phone_ips():
+    try:
+        with open(PHONE_IPS_JSON) as f: d = json.load(f)
+        if isinstance(d, dict): PHONE_IPS.update({norm_mac(k) or k: v for k, v in d.items()})
+    except Exception: pass
 
 def register_phone(conn, hdrs, addr):
     """Handle a phone REGISTER: identify by MAC, attach its connection; unknown MACs go to SEEN for the UI."""
@@ -465,7 +491,9 @@ def register_phone(conn, hdrs, addr):
     ct = uri_of(H(hdrs, "contact"))
     with pstate:
         CONNS[mac] = conn
+        changed = PHONE_IPS.get(mac) != addr[0]
         PHONE_IPS[mac] = addr[0]            # so CAS (a separate connection) can map IP -> extension
+        if changed: save_phone_ips()
         if ct: CONTACTS[mac] = ct
         if mac in PHONES:
             SEEN.pop(mac, None); known = True

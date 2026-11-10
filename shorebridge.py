@@ -47,6 +47,11 @@ TZ       = CFG.get("phone", "timezone", fallback="Eastern Standard Time")
 DEBUG    = CFG.getboolean("bridge", "debug", fallback=False)
 UI_PORT  = CFG.getint("bridge", "ui_port", fallback=8910)
 CSTA_AUTOANSWER = CFG.getboolean("bridge", "csta_test_autoanswer", fallback=False)  # test: auto-fire AnswerCall on inbound ring
+# Reboot connected phones when the bridge is stopped/restarted (SIGTERM). Off by default
+# so dev restarts don't bounce the phone. reboot_when: "on-idle" (wait for no active call)
+# or "immediate". The phone honors Event: reboot;when=<v> over SIP-NOTIFY (firmware-verified).
+REBOOT_ON_RESTART = CFG.getboolean("bridge", "reboot_phones_on_restart", fallback=False)
+REBOOT_WHEN = CFG.get("bridge", "reboot_when", fallback="on-idle").strip() or "on-idle"
 
 HTTP_ROOT = os.path.join(DATA, "www")
 CERT = os.path.join(DATA, "tls", "switch_fullchain.crt")
@@ -1003,6 +1008,64 @@ def send_to_phone_csta(mac, body):
     if out: log(f"CSTA << phone {mac}:\n{out.strip()}")
     return out or "(no reply from phone in 5s)"
 
+def send_to_phone_notify(mac, event, ctype, body, from_user="switch"):
+    """DEBUG: send an arbitrary out-of-dialog NOTIFY to a phone and return its reply."""
+    conn = CONNS.get(mac); contact = CONTACTS.get(mac)
+    if not conn or not contact:
+        return "(phone not connected)"
+    callid = rid(16) + "@" + MYIP; b = body.encode()
+    msg = ("\r\n".join([
+        f"NOTIFY {contact} SIP/2.0",
+        f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)};rport", "Max-Forwards: 70",
+        f"From: <sips:{from_user}@{MYIP}>;tag={rid(8)}", f"To: <{contact}>",
+        f"Call-ID: {callid}", "CSeq: 1 NOTIFY", f"Event: {event}", "Subscription-State: active;expires=3600",
+        f"Contact: <sips:switch@{MYIP}:5061;transport=tls>",
+        f"Content-Type: {ctype}", f"Content-Length: {len(b)}"]) + "\r\n\r\n").encode() + b
+    with pinlock: PIN[callid] = []
+    log(f"DEBUG NOTIFY >> phone {mac}: Event {event}, {ctype}, {len(b)} bytes")
+    try: conn.sendall(msg)
+    except Exception as e:
+        with pinlock: PIN.pop(callid, None)
+        return f"(send error: {e})"
+    end = time.time() + 5; out = None
+    while time.time() < end:
+        with pinlock: q = list(PIN.get(callid, []))
+        if q: out = q[-1]; break
+        time.sleep(0.05)
+    with pinlock: PIN.pop(callid, None)
+    first = (out or "").split("\r\n")[0]
+    log(f"DEBUG NOTIFY << phone {mac}: {first or '(no reply in 5s)'}")
+    return out or "(no reply from phone in 5s)"
+
+def reboot_phone(mac, when=None):
+    """Tell a connected phone to reboot via an unsolicited SIP-NOTIFY
+    'Event: reboot;when=<immediate|on-idle>'. Firmware-verified: NotifyClr::
+    EvUnhandledRequest matches event 'reboot' and reads the 'when' Event-header param
+    (handlePphoneRebootEvent). 'on-idle' defers until the phone has no active call."""
+    when = (when or REBOOT_WHEN).strip().lower()
+    if when not in ("immediate", "on-idle"): when = "on-idle"
+    if mac not in CONNS or mac not in CONTACTS:
+        log(f"reboot {mac}: phone not connected"); return "(phone not connected)"
+    log(f"reboot -> phone {mac}: when={when}")
+    return send_to_phone_notify(mac, f"reboot;when={when}", "text/plain", "", "switch")
+
+def reboot_all_phones(when=None):
+    macs = [m for m in list(CONNS.keys()) if m in CONTACTS]
+    if not macs: log("reboot-all: no connected phones"); return
+    log(f"reboot-all: notifying {len(macs)} phone(s) (when={(when or REBOOT_WHEN)})")
+    for m in macs:
+        try: reboot_phone(m, when)
+        except Exception as e: log(f"reboot {m} err: {e!r}")
+
+def _on_shutdown(signum, frame):
+    """SIGTERM/SIGINT: optionally reboot connected phones before the bridge exits."""
+    log(f"shutdown signal {signum}" + (f"; rebooting phones (when={REBOOT_WHEN})" if REBOOT_ON_RESTART else ""))
+    if REBOOT_ON_RESTART:
+        try: reboot_all_phones()
+        except Exception as e: log(f"shutdown reboot err: {e!r}")
+        time.sleep(1.5)   # give the NOTIFYs time to go out and be ACKed before we exit
+    sys.exit(0)
+
 # ----------------------------- HTTP config/cert server (port 80) -----------------------------
 class QuietHTTP(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a):
@@ -1270,8 +1333,11 @@ def main():
     for p in (CERT, KEY, os.path.join(HTTP_ROOT, "keystore", "certs", "hq_ca.crt")):
         if not os.path.exists(p):
             sys.stderr.write(f"shorebridge: missing {p} (run the installer first)\n"); sys.exit(1)
-    load_phones()
-    log(f"shorebridge starting: bind={MYIP} pbx={SBC_IP}:{SBC_PORT} domain={DOMAIN} phones={len(PHONES)}")
+    load_phones(); load_phone_ips()
+    signal.signal(signal.SIGTERM, _on_shutdown)
+    signal.signal(signal.SIGINT, _on_shutdown)
+    log(f"shorebridge starting: bind={MYIP} pbx={SBC_IP}:{SBC_PORT} domain={DOMAIN} phones={len(PHONES)}"
+        + (f" (reboot phones on restart: when={REBOOT_WHEN})" if REBOOT_ON_RESTART else ""))
     ensure_registrations()
     threading.Thread(target=refresh_catalog, daemon=True).start()
     threading.Thread(target=http_server, daemon=True).start()

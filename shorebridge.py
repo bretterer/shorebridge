@@ -44,6 +44,8 @@ _bind    = CFG.get("bridge", "bind_ip", fallback="auto").strip()
 MYIP     = detect_ip(SBC_IP) if _bind in ("", "auto") else _bind
 DATA     = CFG.get("bridge", "data_dir", fallback="/opt/shorebridge")
 TZ       = CFG.get("phone", "timezone", fallback="Eastern Standard Time")
+# Number the phone's Voicemail key dials (voip.ms: *97 = own mailbox).
+VM_NUMBER = CFG.get("phone", "voicemail_number", fallback="*97")
 DEBUG    = CFG.getboolean("bridge", "debug", fallback=False)
 UI_PORT  = CFG.getint("bridge", "ui_port", fallback=8910)
 CSTA_AUTOANSWER = CFG.getboolean("bridge", "csta_test_autoanswer", fallback=False)  # test: auto-fire AnswerCall on inbound ring
@@ -221,6 +223,106 @@ def ensure_registrations():
                 reg_threads[ext] = True
                 threading.Thread(target=reg_loop, args=(ext,), daemon=True).start()
                 log(f"starting registration for ext {ext}")
+            if ext not in mwi_threads:
+                mwi_threads[ext] = True
+                threading.Thread(target=mwi_loop, args=(ext,), daemon=True).start()
+
+# ----------------------------- voicemail light (MWI) -----------------------------
+# PBX side: per extension, SUBSCRIBE to message-summary (digest auth, refreshed) and
+# answer the PBX's NOTIFYs. Phone side: the phone never subscribes, so we push an
+# unsolicited NOTIFY (simple-message-summary) over its TLS connection on every
+# change and whenever it re-registers.
+MWI = {}                 # ext -> {"waiting": bool, "new": int, "old": int}
+mwi_threads = {}
+MWI_SUBS = {}            # PBX subscription Call-ID -> ext
+MWI_PHONE = {}           # mac -> {"callid","tag","cseq"} for our NOTIFY dialog to the phone
+
+def parse_mwi(body):
+    waiting, new, old = False, 0, 0
+    for line in (body or "").splitlines():
+        k, _, v = line.partition(":"); k = k.strip().lower(); v = v.strip()
+        if k == "messages-waiting": waiting = v.lower().startswith("y")
+        elif k == "voice-message":
+            m = re.match(r"(\d+)\s*/\s*(\d+)", v)
+            if m: new, old = int(m.group(1)), int(m.group(2))
+    return {"waiting": waiting or new > 0, "new": new, "old": old}
+
+def on_mwi(ext, st):
+    prev = MWI.get(ext); MWI[ext] = st
+    if prev != st:
+        log(f"voicemail ext {ext}: {st['new']} new / {st['old']} old -> lamp {'ON' if st['waiting'] else 'off'}")
+    mac = mac_for_ext(ext)
+    if mac: push_mwi_to_phone(mac)
+
+def push_mwi_to_phone(mac):
+    with pstate:
+        conn = CONNS.get(mac); contact = CONTACTS.get(mac); p = PHONES.get(mac)
+    if not (conn and contact and p): return
+    ext = str(p.get("extension", "")); st = MWI.get(ext)
+    if st is None: return
+    d = MWI_PHONE.setdefault(mac, {"callid": rid(16) + "@" + MYIP, "tag": rid(8), "cseq": 0})
+    d["cseq"] += 1
+    body = (f"Messages-Waiting: {'yes' if st['waiting'] else 'no'}\r\n"
+            f"Message-Account: sips:{ext}@{MYIP}\r\n"
+            f"Voice-Message: {st['new']}/{st['old']} (0/0)\r\n").encode()
+    L = [f"NOTIFY {contact} SIP/2.0", f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)};rport",
+         "Max-Forwards: 70", f"From: <sips:{ext}@{MYIP}>;tag={d['tag']}", f"To: <sips:{ext}@{MYIP}>",
+         f"Call-ID: {d['callid']}", f"CSeq: {d['cseq']} NOTIFY", "Event: message-summary",
+         "Subscription-State: active;expires=3600", f"Contact: <sips:switch@{MYIP}:5061;transport=tls>",
+         "Content-Type: application/simple-message-summary", f"Content-Length: {len(body)}"]
+    try:
+        conn.sendall(("\r\n".join(L) + "\r\n\r\n").encode() + body)
+        dbg(f"MWI -> phone {mac}: {'yes' if st['waiting'] else 'no'} {st['new']}/{st['old']}")
+    except Exception as e:
+        log(f"MWI push to {mac} failed: {e!r}")
+
+def mwi_loop(ext):
+    callid = rid(16) + "@" + MYIP; ftag = rid(8); cseq = 0; totag = ""; warned = False
+    with pstate: MWI_SUBS[callid] = ext
+    while True:
+        creds = None
+        with pstate:
+            for mac, p in PHONES.items():
+                if p["extension"] == ext: creds = (p["auth_id"], p["password"]); break
+        if creds is None:
+            with pstate: mwi_threads.pop(ext, None); MWI_SUBS.pop(callid, None)
+            log(f"voicemail subscription for ext {ext} stopped (phone removed)"); return
+        authid, password = creds
+        def mk(n, auth=None, hdr="Authorization"):
+            L = [f"SUBSCRIBE sip:{ext}@{DOMAIN} SIP/2.0",
+                 f"Via: SIP/2.0/UDP {MYIP}:{P3CX};branch=z9hG4bK{rid(16)};rport", "Max-Forwards: 70",
+                 f"From: <sip:{ext}@{DOMAIN}>;tag={ftag}", f"To: <sip:{ext}@{DOMAIN}>" + (f";tag={totag}" if totag else ""),
+                 f"Call-ID: {callid}", f"CSeq: {n} SUBSCRIBE", f"Contact: <sip:{ext}@{MYIP}:{P3CX}>",
+                 "Event: message-summary", "Accept: application/simple-message-summary",
+                 "Expires: 3600", "User-Agent: ShoreBridge/1.0"]
+            if auth: L.append(f"{hdr}: {auth}")
+            L.append("Content-Length: 0"); return "\r\n".join(L) + "\r\n\r\n"
+        cseq += 1
+        with wlock: waiters[callid] = []
+        u3_send(mk(cseq)); r = wait(callid, 4)
+        if r and r.split("\r\n")[0].split()[1] in ("401", "407"):
+            st = r.split("\r\n")[0]
+            hh = [l for l in r.split("\r\n") if l.lower().startswith(("www-authenticate", "proxy-authenticate"))]
+            realm, nonce, qop, opaque = parse_auth(hh[0]) if hh else (None,) * 4
+            hdr = "Proxy-Authorization" if " 407 " in st else "Authorization"
+            auth = digest("SUBSCRIBE", f"sip:{ext}@{DOMAIN}", realm, nonce, qop, rid(16), "00000001", opaque, authid, password)
+            cseq += 1
+            with wlock: waiters[callid] = []
+            u3_send(mk(cseq, auth, hdr)); r = wait(callid, 4)
+        with wlock: waiters.pop(callid, None)
+        code = r.split("\r\n")[0].split()[1] if r else "timeout"
+        if code.startswith("2"):
+            _, h, _ = parse(r); m = re.search(r";tag=([^;>\s]+)", H(h, "to"))
+            if m: totag = m.group(1)
+            try: exp = int(re.sub(r"\D", "", H(h, "expires")) or 3600)
+            except Exception: exp = 3600
+            if warned or not MWI.get(ext): dbg(f"voicemail subscription ext {ext}: {code}, expires {exp}s")
+            warned = False
+            time.sleep(max(60, min(exp - 60, 1800)))
+        else:
+            if not warned: log(f"voicemail subscription ext {ext} failed: {code} (retrying every 10 min)")
+            warned = True; totag = ""
+            time.sleep(600)
 
 CALLS = {}
 PIN = {}; pinlock = threading.Lock()
@@ -247,7 +349,20 @@ def _dispatch(start, hdrs, cid, msg, addr):
         if method == "OPTIONS":
             u3_send(resp_line(200, "OK", hdrs))
         elif method == "INVITE":
-            threading.Thread(target=inbound_invite, args=(hdrs, msg, addr), daemon=True).start()
+            cs = CALLS.get(cid)
+            if cs and cs.alive and ";tag=" in H(hdrs, "to"):      # in-dialog re-INVITE
+                threading.Thread(target=pbx_reinvite, args=(cs, hdrs, msg, addr), daemon=True).start()
+            else:
+                threading.Thread(target=inbound_invite, args=(hdrs, msg, addr), daemon=True).start()
+        elif method == "NOTIFY":
+            u3.sendto(resp_line(200, "OK", hdrs).encode(), addr)
+            if "message-summary" in H(hdrs, "event").lower():
+                _, _, body = parse(msg)
+                ext = MWI_SUBS.get(cid)
+                if not ext:                          # unsolicited: take the user part of To
+                    m = re.search(r"sips?:([^@>;]+)@", H(hdrs, "to")); ext = m.group(1) if m else ""
+                if ext and mac_for_ext(ext): on_mwi(ext, parse_mwi(body))
+                elif DEBUG: dbg(f"MWI NOTIFY for unknown ext {ext!r}")
         elif method in ("BYE", "CANCEL", "ACK"):
             for cs in list(CALLS.values()):
                 if cs.x_callid == cid: cs.on_3cx_request(method, hdrs, msg)
@@ -527,8 +642,21 @@ def phone_handle(conn, addr):
             if method == "REGISTER":
                 mymac = register_phone(conn, hdrs, addr)
                 conn.sendall(p_resp(200, "OK", hdrs, addr, method))
+                if mymac: threading.Timer(2.0, push_mwi_to_phone, args=(mymac,)).start()
             elif method == "INVITE":
-                threading.Thread(target=phone_invite, args=(conn, mymac, hdrs, b, addr), daemon=True).start()
+                cs = CALLS.get(H(hdrs, "call-id"))
+                if cs and cs.alive and ";tag=" in H(hdrs, "to"):  # in-dialog re-INVITE (hold/resume/refresh)
+                    try: phone_reinvite(conn, cs, hdrs, b, addr)
+                    except Exception as e: log(f"phone re-INVITE err {e!r}")
+                else:
+                    threading.Thread(target=phone_invite, args=(conn, mymac, hdrs, b, addr), daemon=True).start()
+            elif method == "SUBSCRIBE":
+                ev = H(hdrs, "event")
+                log(f"phone {mymac} SUBSCRIBE Event: {ev} Accept: {H(hdrs, 'accept')[:120]}")
+                if ev.split(";")[0].strip().lower() == "ua-profile":
+                    threading.Thread(target=ua_profile_subscribe, args=(conn, mymac, hdrs, addr), daemon=True).start()
+                else:
+                    conn.sendall(p_resp(200, "OK", hdrs, addr, method))
             elif method == "BYE":
                 cs = CALLS.get(H(hdrs, "call-id"))
                 conn.sendall(p_resp(200, "OK", hdrs, addr, method))
@@ -651,6 +779,10 @@ def cas_user_name(ext, label):
 
 UNAUTH = object()   # sentinel: make cas_handle answer HTTP 401 (forces the phone to re-login)
 
+# ---- Options-menu PIN ("voicemail password" prompt) ----
+# The phone sends md5(PIN digits) as lowercase hex in "pwd". Each phone's PIN is kept
+# the same way in phones.json ("tui_pwd_md5"). No PIN set -> any PIN opens Options
+# (never lock the user out). 5 wrong tries -> Options locked for 5 minutes.
 def _session_ok(target):
     sid = parse_qs(urlparse(target).query).get("SessionId", [""])[0]
     with CAS_LOCK:
@@ -1056,6 +1188,62 @@ def write_phoneconfig():
         open(cu, "w").write('[site]\ndateFormatLong="\\\\a, \\\\b \\\\d \\\\Y"\n'
                             'timeFormatLong="\\\\h:\\\\m\\\\p"\ndateFormatShort="\\\\n/\\\\d/\\\\Y"\n'
                             'timeFormatShort="\\\\h:\\\\m\\\\p"\n')
+
+# The Voicemail key dials "micloud voicemailloginextension", which the firmware only
+# writes from ua-profile subscription data (UaProfSvc::EvUpdated -> PhUaProfMgr::
+# UpdateSvcData). .txt keys, Aastra-style lines and unsolicited ua-profile NOTIFYs all
+# had no effect (tested 2026-11-09). Kept so that if the phone ever SUBSCRIBEs to
+# ua-profile, it gets the voicemail number.
+def ua_profile_body(mac):
+    """[user] block delivered through a ua-profile subscription -> PhUaProfMgr::
+    UpdateSvcData; unknown keys become "micloud <key>" (lowercase is significant)."""
+    lines = ["[user]"]
+    if VM_NUMBER:
+        lines += [f"voicemailloginextension={VM_NUMBER}", f"voicemailextension={VM_NUMBER}"]
+    return "\n".join(lines) + "\n"
+
+def ua_profile_subscribe(conn, mac, hdrs, addr):
+    """Accept the phone's ua-profile SUBSCRIBE, then NOTIFY inside that dialog."""
+    totag = mktag(H(hdrs, "call-id") + "srv")       # same tag p_resp puts on the 200 OK
+    r = p_resp(200, "OK", hdrs, addr, "SUBSCRIBE")
+    conn.sendall(r)
+    time.sleep(0.3)
+    body = ua_profile_body(mac).encode()
+    acc = H(hdrs, "accept").split(",")[0].strip() or "text/plain"
+    ct = uri_of(H(hdrs, "contact")) or CONTACTS.get(mac, "")
+    to_hdr = H(hdrs, "from")                       # their From becomes our To
+    frm = H(hdrs, "to")
+    if ";tag=" not in frm: frm += ";tag=" + totag
+    L = [f"NOTIFY {ct} SIP/2.0", f"Via: SIP/2.0/TLS {MYIP}:5061;branch=z9hG4bK{rid(16)};rport",
+         "Max-Forwards: 70", f"From: {frm}", f"To: {to_hdr}", f"Call-ID: {H(hdrs, 'call-id')}",
+         "CSeq: 1 NOTIFY", f"Event: {H(hdrs, 'event')}", "Subscription-State: active;expires=3600",
+         f"Contact: <sips:switch@{MYIP}:5061;transport=tls>",
+         f"Content-Type: {acc}", f"Content-Length: {len(body)}"]
+    with pinlock: PIN[H(hdrs, "call-id")] = []
+    conn.sendall(("\r\n".join(L) + "\r\n\r\n").encode() + body)
+    end = time.time() + 5; reply = None
+    while time.time() < end and not reply:
+        with pinlock: q = [m for m in PIN.get(H(hdrs, "call-id"), []) if "NOTIFY" in H(parse(m)[1], "cseq")]
+        if q: reply = q[-1]
+        time.sleep(0.05)
+    with pinlock: PIN.pop(H(hdrs, "call-id"), None)
+    log(f"ua-profile NOTIFY to {mac} ({acc}, {len(body)} bytes): "
+        + ((reply or "").split("\r\n")[0] or "no reply"))
+
+# ---- programmable buttons / BB424 (804 firmware p8_phone ProgrammableButtonsDM) ----
+# [progbuttons] holds one value: ';'-separated records, each starting "SK=<n>".
+# n = line+1; line 0-15 = the phone's own keys, 16+24*(box-1)+btn = button box
+# keys, so BB424 #1 buttons 1-24 are SK=17..40 (translateLineToPair). Record:
+# SK=n;label;funcId;target;flag;ringDelay;noConnAction;connAction;stackPos;
+#      target2;papi;longLabel;   (field positions from ProgrammableButtonDM getters;
+# label/longLabel positions inferred). funcId = firmware EnumProgButton codes.
+def p8_extra_blocks(p=None):
+    """Extra pphone.conf keys served per phone. SysConfigDM.voiceMailLoginExtension
+    (exact case) is what the Voicemail key dials -- works. [progbuttons] is intentionally
+    NOT emitted: disassembly + the 2026-11-09 speed-dial test proved the phone builds its
+    8 keys from locally persisted state (not the served file) and never builds a button
+    device for the BB424, so emitting it only risks disturbing the phone's own keys."""
+    return f"[system]\nvoiceMailLoginExtension={VM_NUMBER}\n" if VM_NUMBER else ""
 
 def http_server():
     write_phoneconfig()
